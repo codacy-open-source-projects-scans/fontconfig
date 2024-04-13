@@ -114,9 +114,11 @@ elif [ x"$buildsys" == "xmeson" ]; then
     done
     case x"$backend" in
         'xexpat')
-        ;;
+            buildopt+=(-Dxml-backend=expat)
+            ;;
         'xlibxml2')
-        ;;
+            buildopt+=(-Dxml-backend=libxml2)
+            ;;
     esac
     if [ $cross -eq 1 -a -n "$arch" ]; then
         buildopt+=(--cross-file)
@@ -128,7 +130,7 @@ elif [ x"$buildsys" == "xmeson" ]; then
         . .gitlab-ci/$FC_DISTRO_NAME-cross.sh
     fi
     buildopt+=(--default-library=$type)
-    meson setup --prefix="$PREFIX" -Dnls=enabled -Dcache-build=disabled ${buildopt[*]} "$BUILDDIR" 2>&1 | tee /tmp/fc-build.log || r=$?
+    meson setup --prefix="$PREFIX" -Dnls=enabled -Dcache-build=disabled -Diconv=enabled ${buildopt[*]} "$BUILDDIR" 2>&1 | tee /tmp/fc-build.log || r=$?
     meson compile -v -C "$BUILDDIR" 2>&1 | tee -a /tmp/fc-build.log || r=$?
     if [ $disable_check -eq 0 ]; then
         meson test -v -C "$BUILDDIR" 2>&1 | tee -a /tmp/fc-build.log || r=$?

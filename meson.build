@@ -1,8 +1,10 @@
 project('fontconfig', 'c',
   version: '2.15.0',
-  meson_version : '>= 0.60.0',
+  meson_version : '>= 1.3.0',
   default_options: [ 'buildtype=debugoptimized'],
 )
+
+fs = import('fs')
 
 fc_version = meson.project_version()
 version_arr = fc_version.split('.')
@@ -25,6 +27,8 @@ freetype_req_cmake = '>= 2.8.1'
 cc = meson.get_compiler('c')
 math_dep = cc.find_library('m', required: false)
 
+conf = configuration_data()
+
 freetype_dep = dependency('freetype2', method: 'pkg-config', version: freetype_req, required: false)
 
 # Give another shot using CMake
@@ -33,13 +37,27 @@ if not freetype_dep.found()
     fallback: ['freetype2', 'freetype_dep'], default_options: 'werror=false')
 endif
 
-# Linking expat should not be so difficult... see: https://github.com/mesonbuild/meson/issues/10516
-expat_dep = dependency('expat', required: false)
-if not expat_dep.found()
-  expat_dep = cc.find_library('expat', required : false)
-  if not expat_dep.found()
-    expat_dep = dependency('expat', method: 'system', fallback: ['expat', 'expat_dep'])
+xml_dep = dependency('', required: false)
+xmlbackend = get_option('xml-backend')
+xmltype = ''
+if xmlbackend == 'auto' or xmlbackend == 'expat'
+  # Linking expat should not be so difficult... see: https://github.com/mesonbuild/meson/issues/10516
+  xml_dep = dependency('expat', required: false)
+  if not xml_dep.found()
+    xml_dep = cc.find_library('expat', required : false)
+    if not xml_dep.found() and xmlbackend == 'expat'
+      xml_dep = dependency('expat', method: 'system', required: true, fallback: ['expat', 'expat_dep'])
+    else
+      xmltype = 'expat'
+    endif
   endif
+endif
+if (xmlbackend == 'auto' and not xml_dep.found()) or xmlbackend == 'libxml2'
+  xml_dep = dependency('libxml-2.0', required: true)
+  conf.set('ENABLE_LIBXML2', 1)
+endif
+if xmltype == ''
+  xmltype = xml_dep.name()
 endif
 
 pkgmod = import('pkgconfig')
@@ -133,8 +151,7 @@ add_project_arguments('-DHAVE_CONFIG_H', language: 'c')
 
 c_args = []
 
-conf = configuration_data()
-deps = [freetype_dep, expat_dep]
+deps = [freetype_dep, xml_dep]
 incbase = include_directories('.')
 
 # For compatibility to autoconf (regardless of the usage in fontconfig)
@@ -157,6 +174,24 @@ if libintl_dep.found()
 else
   opt_nls = opt_nls.require(false)
 endif
+
+# Check iconv support
+iconv = get_option('iconv')
+iconv_dep = dependency('', required: false)
+found_iconv = 0
+if iconv.allowed()
+  iconv_dep = cc.find_library('iconv', required: false)
+  if cc.has_header_symbol('iconv.h', 'libiconv_open', dependencies: libintl_dep)
+    conf.set('LIBICONV_PLUG', 1)
+    found_iconv = 1
+  elif cc.has_header('iconv.h') and cc.has_function('iconv_open', dependencies: iconv_dep)
+    found_iconv = 1
+  else
+    iconv.require(false)
+  endif
+endif
+conf.set('USE_ICONV', found_iconv)
+deps += [iconv_dep]
 
 # We cannot try compiling against an internal dependency
 if freetype_dep.type_name() == 'internal'
@@ -251,20 +286,6 @@ if cc.links(files('meson-cc-tests/solaris-atomic-operations.c'), name: 'Solaris 
   conf.set('HAVE_SOLARIS_ATOMIC_OPS', 1)
 endif
 
-
-# Check iconv support
-iconv_dep = []
-found_iconv = 0
-if host_machine.system() != 'windows'
-  iconv_dep = dependency('iconv', required: get_option('iconv'))
-  found_iconv = iconv_dep.found().to_int()
-else
-  if get_option('iconv').enabled()
-    warning('-Diconv was set but this is not functional on Windows.')
-  endif
-endif
-conf.set('USE_ICONV', found_iconv)
-deps += [iconv_dep]
 
 prefix = get_option('prefix')
 
@@ -419,10 +440,7 @@ foreach t : ['uint64_t', 'int32_t', 'uintptr_t', 'intptr_t']
   endif
 endforeach
 
-fcstdint_h = configure_file(
-  input: 'src/fcstdint.h.in',
-  output: 'fcstdint.h',
-  copy: true)
+fcstdint_h = fs.copyfile('src/fcstdint.h.in', 'fcstdint.h')
 
 makealias = files('src/makealias.py')[0]
 
@@ -503,6 +521,7 @@ summary({
   'Tests': not get_option('tests').disabled(),
   'Tools': not get_option('tools').disabled(),
   'iconv': found_iconv == 1,
+  'XML backend': xmltype,
 }, section: 'General', bool_yn: true, list_sep: ', ')
 summary({
   'Hinting': preferred_hinting,
