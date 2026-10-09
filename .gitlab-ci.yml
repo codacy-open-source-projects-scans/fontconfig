@@ -10,7 +10,7 @@
 # and run ci-fairy generate-template. For details, see
 # https://freedesktop.pages.freedesktop.org/ci-templates/ci-fairy.html#templating-gitlab-ci-yml
 
-.templates_sha: &template_sha 5cc6ded703fc990f9d055f0d948ffd4460a9ca40
+.templates_sha: &template_sha 208764ef4d97de775cee10f1c206635e2964b257
 
 include:
   # Alpine container builder template
@@ -28,12 +28,12 @@ include:
   - project: 'freedesktop/ci-templates'
     ref: *template_sha
     file: '/templates/ci-fairy.yml'
+  - local: '.gitlab-ci/msys2.yml'
   - local: '.gitlab-ci/other.yml'
 
 stages:
   - sanity check
   - prep
-  - build
   - test
   - distro
   - deploy
@@ -47,13 +47,15 @@ variables:
 # changing these will force rebuilding the associated image
 # Note: these tags have no meaning and are not tied to a particular
 # fontconfig version
-  ALPINE_TAG:    '2026-04-27.1-4cdb2241724d'
-  FEDORA_TAG:    '2026-04-27.1-8aa997a7deec'
-  FREEBSD_TAG:   '2026-04-27.1-914edb6cad41'
+  ALPINE_TAG:    '2026-09-23.0-ec274ade7c46'
+  FEDORA_TAG:    '2026-09-23.0-8f6b51eabf9d'
+  FREEBSD_TAG:   '2026-09-23.0-85b06fe24682'
+  MSYS2_TAG:     '2026-09-23.0-2d9f4689db45'
 
   ALPINE_EXEC:   'bash .gitlab-ci/alpine-install.sh'
   FEDORA_EXEC:   'bash .gitlab-ci/fedora-install.sh'
   FREEBSD_EXEC:  'bash .gitlab-ci/freebsd-install.sh'
+  MSYS2_EXEC:    'bash .gitlab-ci/msys2-install.sh'
 
 #######################################
 #                                     #
@@ -89,6 +91,62 @@ check-ci-script:
         "https://freedesktop.pages.freedesktop.org/ci-templates/ci-fairy.html#templating-gitlab-ci-yml"
     - exit 1
 
+lint-changelog-trailer:
+  stage: sanity check
+  image: alpine:latest
+  variables:
+    GIT_DEPTH: 0
+  before_script:
+    - apk add --no-cache git
+  script:
+    # Use the GitLab-provided merge base so the range is correct even for
+    # fork pipelines and regardless of how the source branch is named.
+    - BASE_SHA=$CI_MERGE_REQUEST_DIFF_BASE_SHA
+    # With GIT_DEPTH:0 the base is already present; fetch is a best-effort
+    # fallback and must not fail the job if the server rejects a SHA fetch.
+    - git cat-file -e "$BASE_SHA^{commit}" 2>/dev/null || git fetch origin $BASE_SHA || true
+    - COMMIT_SHAs=$(git log $BASE_SHA..HEAD --format="%H")
+    - |
+      if [ -z "$COMMIT_SHAs" ]; then
+        echo "❌ ERROR: Empty commit range ($BASE_SHA..HEAD)."
+        echo "The changelog trailer check could not inspect any commit."
+        echo "This usually means the merge base could not be resolved; please report it."
+        exit 1
+      fi
+    - ALL_SKIPPED=true
+    - TRAILER_FOUND=false
+    - |
+      for sha in $COMMIT_SHAs; do
+        COMMIT_SUMMARY=$(git log -n 1 --format="%s" $sha)
+        COMMIT_BODY=$(git log -n 1 --format="%B" $sha)
+        if echo "$COMMIT_SUMMARY" | grep -Eiq "^ci:"; then
+          echo "ℹ️ Skipping ci commit: '$COMMIT_SUMMARY'"
+          continue
+        fi
+        ALL_SKIPPED=false
+        if echo "$COMMIT_BODY" | git interpret-trailers --parse | grep -Eiq "^Changelog\s*:"; then
+          TRAILER_FOUND=true
+          break
+        fi
+      done
+    - |
+      if [ "$ALL_SKIPPED" = true ]; then
+        echo "✅ All commits are ci-only, skipping trailer enforcement."
+      elif [ "$TRAILER_FOUND" = false ]; then
+        echo "❌ ERROR: No 'Changelog:' trailer found in your MR commits!"
+        echo "Please add a trailer to your commit message (e.g., 'Changelog: fixed')."
+        echo "See https://docs.gitlab.com/user/project/changelogs/"
+        echo "If it is not worth advertising, set skip-changelog label"
+        exit 1
+      else
+        echo "✅ Changelog trailer found."
+      fi
+  rules:
+    - if: $CI_MERGE_REQUEST_IID && $CI_MERGE_REQUEST_LABELS =~ /(^|,)skip-changelog(,|$)/
+      when: never
+    - if: $CI_MERGE_REQUEST_IID
+      when: on_success
+
 #######################################
 #                                     #
 #          containers stage           #
@@ -104,7 +162,7 @@ alpine:edge@container-prep:
   variables:
     GIT_STRATEGY: none
     FDO_DISTRIBUTION_VERSION: 'edge'
-    FDO_DISTRIBUTION_PACKAGES: 'freetype-dev expat-dev python3-dev gperf util-linux-dev json-c-dev curl bash py3-pip gcc ninja-build bubblewrap pkgconf musl-dev uuidgen'
+    FDO_DISTRIBUTION_PACKAGES: 'freetype-dev expat-dev python3-dev gperf util-linux-dev json-c-dev curl bash py3-pip gcc ninja-build bubblewrap pkgconf musl-dev uuidgen woff2 woff2-dev'
     FDO_DISTRIBUTION_TAG: $ALPINE_TAG
     FDO_DISTRIBUTION_EXEC: $ALPINE_EXEC
 
@@ -114,7 +172,17 @@ fedora:rawhide@container-prep:
   variables:
     GIT_STRATEGY: none
     FDO_DISTRIBUTION_VERSION: 'rawhide'
-    FDO_DISTRIBUTION_PACKAGES: '@buildsys-build autoconf automake clang-devel clang-tools-extra curl libtool gettext gettext-devel gperf expat-devel libxml2-devel freetype-devel json-c-devel git git-clang-format docbook-utils docbook-utils-pdf bubblewrap ninja-build wget python3-pip mingw64-expat mingw64-gcc mingw64-gettext mingw64-freetype mingw64-libxml2 rust cargo bindgen-cli libasan libubsan libabigail mingw64-json-c'
+    FDO_DISTRIBUTION_PACKAGES: '@buildsys-build clang-devel clang-tools-extra curl gettext gettext-devel gperf expat-devel libxml2-devel freetype-devel json-c-devel git git-clang-format docbook-utils wkhtmltopdf bubblewrap ninja-build wget python3-pip rust cargo bindgen-cli libasan libtsan libubsan libabigail woff2 woff2-devel woff2-tools'
+    FDO_DISTRIBUTION_TAG: $FEDORA_TAG
+    FDO_DISTRIBUTION_EXEC: $FEDORA_EXEC
+
+fedora:45@container-prep:
+  extends: .fdo.container-build@fedora
+  stage: prep
+  variables:
+    GIT_STRATEGY: none
+    FDO_DISTRIBUTION_VERSION: '45'
+    FDO_DISTRIBUTION_PACKAGES: '@buildsys-build clang-devel clang-tools-extra curl gettext gettext-devel gperf expat-devel libxml2-devel freetype-devel json-c-devel git git-clang-format docbook-utils wkhtmltopdf bubblewrap ninja-build wget python3-pip rust cargo bindgen-cli libasan libtsan libubsan libabigail woff2 woff2-devel woff2-tools'
     FDO_DISTRIBUTION_TAG: $FEDORA_TAG
     FDO_DISTRIBUTION_EXEC: $FEDORA_EXEC
 
@@ -124,31 +192,31 @@ fedora:44@container-prep:
   variables:
     GIT_STRATEGY: none
     FDO_DISTRIBUTION_VERSION: '44'
-    FDO_DISTRIBUTION_PACKAGES: '@buildsys-build autoconf automake clang-devel clang-tools-extra curl libtool gettext gettext-devel gperf expat-devel libxml2-devel freetype-devel json-c-devel git git-clang-format docbook-utils docbook-utils-pdf bubblewrap ninja-build wget python3-pip mingw64-expat mingw64-gcc mingw64-gettext mingw64-freetype mingw64-libxml2 rust cargo bindgen-cli libasan libubsan libabigail'
+    FDO_DISTRIBUTION_PACKAGES: '@buildsys-build clang-devel clang-tools-extra curl gettext gettext-devel gperf expat-devel libxml2-devel freetype-devel json-c-devel git git-clang-format docbook-utils wkhtmltopdf bubblewrap ninja-build wget python3-pip rust cargo bindgen-cli libasan libtsan libubsan libabigail woff2 woff2-devel woff2-tools'
     FDO_DISTRIBUTION_TAG: $FEDORA_TAG
     FDO_DISTRIBUTION_EXEC: $FEDORA_EXEC
 
-fedora:43@container-prep:
-  extends: .fdo.container-build@fedora
-  stage: prep
-  variables:
-    GIT_STRATEGY: none
-    FDO_DISTRIBUTION_VERSION: '43'
-    FDO_DISTRIBUTION_PACKAGES: '@buildsys-build autoconf automake clang-devel clang-tools-extra curl libtool gettext gettext-devel gperf expat-devel libxml2-devel freetype-devel json-c-devel git git-clang-format docbook-utils docbook-utils-pdf bubblewrap ninja-build wget python3-pip mingw64-expat mingw64-gcc mingw64-gettext mingw64-freetype mingw64-libxml2 rust cargo bindgen-cli libasan libubsan libabigail'
-    FDO_DISTRIBUTION_TAG: $FEDORA_TAG
-    FDO_DISTRIBUTION_EXEC: $FEDORA_EXEC
-
-freebsd:14.3@container-prep:
+freebsd:14.4@container-prep:
   extends: .fdo.qemu-build@freebsd
   tags:
     - kvm
   stage: prep
   variables:
     GIT_STRATEGY: none
-    FDO_DISTRIBUTION_VERSION: '14.3'
-    FDO_DISTRIBUTION_PACKAGES: 'gcc autoconf automake libtool gettext gperf expat libxml2 freetype2 json-c git ninja wget python3 py311-pip pkgconf gmake gettext-runtime'
+    FDO_DISTRIBUTION_VERSION: '14.4'
+    FDO_DISTRIBUTION_PACKAGES: 'gcc gettext gperf expat libxml2 freetype2 json-c git wget python3 py312-pip pkgconf gmake gettext-runtime ninja woff2'
     FDO_DISTRIBUTION_TAG: $FREEBSD_TAG
     FDO_DISTRIBUTION_EXEC: $FREEBSD_EXEC
+
+msys2:latest@container-prep:
+  extends: .fdo.container-build@msys2
+  stage: prep
+  variables:
+    GIT_STRATEGY: none
+    FDO_DISTRIBUTION_VERSION: 'latest'
+    FDO_DISTRIBUTION_PACKAGES: 'git mingw-w64-ucrt-x86_64-expat mingw-w64-ucrt-x86_64-freetype mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-gperf mingw-w64-ucrt-x86_64-meson mingw-w64-ucrt-x86_64-python mingw-w64-ucrt-x86_64-python-certifi mingw-w64-ucrt-x86_64-python-pip mingw-w64-ucrt-x86_64-python-yaml mingw-w64-ucrt-x86_64-woff2 mingw-w64-x86_64-expat mingw-w64-x86_64-freetype mingw-w64-x86_64-gcc mingw-w64-x86_64-gperf mingw-w64-x86_64-meson mingw-w64-x86_64-python mingw-w64-x86_64-python-certifi mingw-w64-x86_64-python-pip mingw-w64-x86_64-python-yaml mingw-w64-x86_64-woff2'
+    FDO_DISTRIBUTION_TAG: $MSYS2_TAG
+    FDO_DISTRIBUTION_EXEC: $MSYS2_EXEC
 
 #######################################
 #                                     #
@@ -201,6 +269,15 @@ fedora:rawhide@container-clean:
     FDO_DISTRIBUTION_VERSION: 'rawhide'
     FDO_DISTRIBUTION_TAG: $FEDORA_TAG
 
+fedora:45@container-clean:
+  extends:
+    - .container-clean
+  variables:
+    GIT_STRATEGY: none
+    CURRENT_CONTAINER_IMAGE: $CI_REGISTRY_IMAGE/fedora/$FDO_DISTRIBUTION_VERSION:$FDO_DISTRIBUTION_TAG
+    FDO_DISTRIBUTION_VERSION: '45'
+    FDO_DISTRIBUTION_TAG: $FEDORA_TAG
+
 fedora:44@container-clean:
   extends:
     - .container-clean
@@ -210,23 +287,23 @@ fedora:44@container-clean:
     FDO_DISTRIBUTION_VERSION: '44'
     FDO_DISTRIBUTION_TAG: $FEDORA_TAG
 
-fedora:43@container-clean:
-  extends:
-    - .container-clean
-  variables:
-    GIT_STRATEGY: none
-    CURRENT_CONTAINER_IMAGE: $CI_REGISTRY_IMAGE/fedora/$FDO_DISTRIBUTION_VERSION:$FDO_DISTRIBUTION_TAG
-    FDO_DISTRIBUTION_VERSION: '43'
-    FDO_DISTRIBUTION_TAG: $FEDORA_TAG
-
-freebsd:14.3@container-clean:
+freebsd:14.4@container-clean:
   extends:
     - .container-clean
   variables:
     GIT_STRATEGY: none
     CURRENT_CONTAINER_IMAGE: $CI_REGISTRY_IMAGE/freebsd/$FDO_DISTRIBUTION_VERSION:$FDO_DISTRIBUTION_TAG
-    FDO_DISTRIBUTION_VERSION: '14.3'
+    FDO_DISTRIBUTION_VERSION: '14.4'
     FDO_DISTRIBUTION_TAG: $FREEBSD_TAG
+
+msys2:latest@container-clean:
+  extends:
+    - .container-clean
+  variables:
+    GIT_STRATEGY: none
+    CURRENT_CONTAINER_IMAGE: $CI_REGISTRY_IMAGE/msys2/$FDO_DISTRIBUTION_VERSION:$FDO_DISTRIBUTION_TAG
+    FDO_DISTRIBUTION_VERSION: 'latest'
+    FDO_DISTRIBUTION_TAG: $MSYS2_TAG
 
 
 #######################################
@@ -264,6 +341,7 @@ freebsd:14.3@container-clean:
         buildopt+=(-d $bo)
       done
       [ -n "$FC_BUILD_ARCH" ] && buildopt+=(-a $FC_BUILD_ARCH)
+      [ $FC_BUILD_NO_VENV -eq 1 ] && buildopt+=(-V)
       [ $FC_BUILD_DISTCHECK -eq 1 ] && buildopt+=(-c)
       [ $FC_BUILD_NO_INSTALL -eq 1 ] && buildopt+=(-I)
       [ $FC_BUILD_NO_CHECK -eq 1 ] && buildopt+=(-C)
@@ -271,15 +349,15 @@ freebsd:14.3@container-clean:
       buildopt+=(-t $FC_BUILD_TYPE)
       buildopt+=(-X $FC_XML_BACKEND)
       buildopt+=(-O g)
+      buildopt+=(-e test-hooks)
       export buildopt
     - "scp -r $(pwd) vm:"
     - echo "CI_JOB_ID=\"$CI_JOB_ID\"" > fcenv
     - echo "CI_JOB_NAME=\"$CI_JOB_NAME\"" >> fcenv
     - echo "BUILD_ID=\"$BUILD_ID\"" >> fcenv
     - echo "MAKEFLAGS=\"$MAKEFLAGS\"" >> fcenv
-    - echo "MAKE=\"$MAKE\"" >> fcenv
     - "scp fcenv vm:~/$CI_PROJECT_NAME/.gitlab-ci/fcenv"
-    - /app/vmctl exec "cd $CI_PROJECT_NAME ; bash .gitlab-ci/build.sh ${buildopt[@]}" && touch .success || true
+    - /app/vmctl exec "cd $CI_PROJECT_NAME ; python3 .gitlab-ci/build.py -E ${buildopt[@]}" && touch .success || true
     - scp -r vm:$CI_PROJECT_NAME/build $BUILDDIR
 
     - *check_tainted
@@ -290,15 +368,17 @@ freebsd:14.3@container-clean:
         exit 1 ;
       fi
   variables:
-    FC_BUILDSYS: autotools
+    FC_BUILDSYS: meson
     FC_XML_BACKEND: expat
     FC_BUILD_TYPE: both
     FC_BUILD_DISTCHECK: 0
     FC_BUILD_NO_INSTALL: 0
     FC_BUILD_NO_CHECK: 0
+    FC_BUILD_NO_VENV: 0
 
 .build@template:
   script:
+    - set -e
     - export BUILD_ID="fontconfig-$CI_JOB_NAME_$CI_COMMIT_SHA-$CI_JOB_ID"
     - export PREFIX="$(pwd)/prefix-$BUILD_ID"
     - export BUILDDIR="$(pwd)/build-$BUILD_ID"
@@ -312,6 +392,7 @@ freebsd:14.3@container-clean:
         buildopt+=(-d $bo)
       done
       [ -n "$FC_BUILD_ARCH" ] && buildopt+=(-a $FC_BUILD_ARCH)
+      [ $FC_BUILD_NO_VENV -eq 1 ] && buildopt+=(-V)
       [ $FC_BUILD_DISTCHECK -eq 1 ] && buildopt+=(-c)
       [ $FC_BUILD_NO_INSTALL -eq 1 ] && buildopt+=(-I)
       [ $FC_BUILD_NO_CHECK -eq 1 ] && buildopt+=(-C)
@@ -321,15 +402,45 @@ freebsd:14.3@container-clean:
       buildopt+=(-t $FC_BUILD_TYPE)
       buildopt+=(-X $FC_XML_BACKEND)
       buildopt+=(-O g)
-      bash .gitlab-ci/build.sh ${buildopt[@]}
+      buildopt+=(-e test-hooks)
+      export buildopt
+    - echo "CI_JOB_ID=\"$CI_JOB_ID\"" > fcenv
+    - echo "CI_JOB_NAME=\"$CI_JOB_NAME\"" >> fcenv
+    - echo "BUILD_ID=\"$BUILD_ID\"" >> fcenv
+    - echo "MAKEFLAGS=\"$MAKEFLAGS\"" >> fcenv
+    - cp fcenv .gitlab-ci/fcenv
+    - |
+      if [ -n "$FC_BUILD_SH" ]; then
+        echo "FC_BUILD_SH: ${FC_BUILD_SH[@]}"
+        echo "MSYSTEM: $MSYSTEM"
+        echo "CI_PROJECT_DIR: $CI_PROJECT_DIR"
+        fc_parent_builddir=$(dirname $CI_PROJECT_DIR)
+        # Expects the target is MSYS2 so far.
+        mkdir -p ~/.wine/drive_c/msys64/$fc_parent_builddir
+        CWD=$(pwd)
+        cd /
+        mv $CI_PROJECT_DIR ~/.wine/drive_c/msys64/$fc_parent_builddir/
+        echo "${FC_BUILD_SH[@]} 'cd \$1; shift; python3 .gitlab-ci/build.py -E \"\$@\"' -- \"$CWD\" \"${buildopt[@]}\""
+        ${FC_BUILD_SH[@]} 'cd $1; shift; python3 .gitlab-ci/build.py -E "$@"' -- "$CWD" "${buildopt[@]}"
+        mv ~/.wine/drive_c/msys64/$CI_PROJECT_DIR $fc_parent_builddir/
+        cd $CWD
+      else
+        echo python3 .gitlab-ci/build.py -E ${buildopt[@]}
+        python3 .gitlab-ci/build.py -E ${buildopt[@]}
+      fi
+    - |
+      if [ -n "$FC_TEST_EXEC" ] && [ -f ".gitlab-ci/test-${FC_TEST_EXEC}.sh" ]; then
+        sh ".gitlab-ci/test-${FC_TEST_EXEC}.sh"
+      fi
   variables:
-    FC_BUILDSYS: autotools
+    FC_BUILDSYS: meson
     FC_XML_BACKEND: expat
     FC_BUILD_TYPE: both
     FC_BUILD_DISTCHECK: 0
     FC_BUILD_NO_INSTALL: 0
     FC_BUILD_NO_CHECK: 0
     FC_BUILD_SUBPROJECT: 0
+    FC_BUILD_NO_VENV: 0
 
 .fc_artifacts:
   artifacts:
@@ -349,6 +460,7 @@ freebsd:14.3@container-clean:
       - build*/fontconfig/fontconfig.h
       - build*/libfontconfig.so*
       - build*/src/.libs/libfontconfig.so*
+      - build*/fc-*/fc-*
       - prefix*
     reports:
       junit: build*/meson-logs/testlog.junit.xml
@@ -366,72 +478,12 @@ freebsd:14.3@container-clean:
 
 #######################################
 #                                     #
-#             build stage             #
+#             test stage              #
 #                                     #
 #######################################
 
-build-autotools shared expat:
-  stage: build
-  extends:
-    - .build@template
-    - .fdo.distribution-image@fedora
-    - .fc_artifacts
-  variables:
-    FC_DISTRO_NAME: fedora
-    FDO_DISTRIBUTION_VERSION: rawhide
-    FDO_DISTRIBUTION_TAG: $FEDORA_TAG
-    FC_BUILDSYS: autotools
-    FC_BUILD_TYPE: shared
-    FC_XML_BACKEND: expat
-  needs:
-    - fedora:rawhide@container-prep
-build-autotools shared libxml2:
-  stage: build
-  extends:
-    - .build@template
-    - .fdo.distribution-image@fedora
-    - .fc_artifacts
-  variables:
-    FC_DISTRO_NAME: fedora
-    FDO_DISTRIBUTION_VERSION: rawhide
-    FDO_DISTRIBUTION_TAG: $FEDORA_TAG
-    FC_BUILDSYS: autotools
-    FC_BUILD_TYPE: shared
-    FC_XML_BACKEND: libxml2
-  needs:
-    - fedora:rawhide@container-prep
-build-autotools static expat:
-  stage: build
-  extends:
-    - .build@template
-    - .fdo.distribution-image@fedora
-    - .fc_artifacts
-  variables:
-    FC_DISTRO_NAME: fedora
-    FDO_DISTRIBUTION_VERSION: rawhide
-    FDO_DISTRIBUTION_TAG: $FEDORA_TAG
-    FC_BUILDSYS: autotools
-    FC_BUILD_TYPE: static
-    FC_XML_BACKEND: expat
-  needs:
-    - fedora:rawhide@container-prep
-build-autotools static libxml2:
-  stage: build
-  extends:
-    - .build@template
-    - .fdo.distribution-image@fedora
-    - .fc_artifacts
-  variables:
-    FC_DISTRO_NAME: fedora
-    FDO_DISTRIBUTION_VERSION: rawhide
-    FDO_DISTRIBUTION_TAG: $FEDORA_TAG
-    FC_BUILDSYS: autotools
-    FC_BUILD_TYPE: static
-    FC_XML_BACKEND: libxml2
-  needs:
-    - fedora:rawhide@container-prep
 build-meson shared expat:
-  stage: build
+  stage: test
   extends:
     - .build@template
     - .fdo.distribution-image@fedora
@@ -443,10 +495,12 @@ build-meson shared expat:
     FC_BUILDSYS: meson
     FC_BUILD_TYPE: shared
     FC_XML_BACKEND: expat
+    FC_TEST_EXEC: cache-compat
+    FC_BASELINE_TAG: 
   needs:
     - fedora:rawhide@container-prep
 build-meson shared libxml2:
-  stage: build
+  stage: test
   extends:
     - .build@template
     - .fdo.distribution-image@fedora
@@ -458,25 +512,11 @@ build-meson shared libxml2:
     FC_BUILDSYS: meson
     FC_BUILD_TYPE: shared
     FC_XML_BACKEND: libxml2
+    FC_TEST_EXEC: meson-install-shared
   needs:
     - fedora:rawhide@container-prep
-build-meson static expat:
-  stage: build
-  extends:
-    - .build@template
-    - .fdo.distribution-image@fedora
-    - .fc_artifacts
-  variables:
-    FC_DISTRO_NAME: fedora
-    FDO_DISTRIBUTION_VERSION: rawhide
-    FDO_DISTRIBUTION_TAG: $FEDORA_TAG
-    FC_BUILDSYS: meson
-    FC_BUILD_TYPE: static
-    FC_XML_BACKEND: expat
-  needs:
-    - fedora:rawhide@container-prep
-build-meson static libxml2:
-  stage: build
+build-meson static libxml2 fontations:
+  stage: test
   extends:
     - .build@template
     - .fdo.distribution-image@fedora
@@ -488,29 +528,11 @@ build-meson static libxml2:
     FC_BUILDSYS: meson
     FC_BUILD_TYPE: static
     FC_XML_BACKEND: libxml2
-  needs:
-    - fedora:rawhide@container-prep
-build-meson static fontations:
-  stage: build
-  extends:
-    - .build@template
-    - .fdo.distribution-image@fedora
-    - .fc_artifacts
-  variables:
-    FC_DISTRO_NAME: fedora
-    FDO_DISTRIBUTION_VERSION: rawhide
-    FDO_DISTRIBUTION_TAG: $FEDORA_TAG
-    FC_BUILDSYS: meson
-    FC_BUILD_TYPE: static
-    FC_BUILD_ENABLED: fontations
+    FC_BUILD_ENABLED: fontations woff2
+    FC_TEST_EXEC: meson-install-static
   needs:
     - fedora:rawhide@container-prep
 
-#######################################
-#                                     #
-#                 test                #
-#                                     #
-#######################################
 
 .test_hook@template:
   script:
@@ -574,34 +596,6 @@ subproject-build static:
     FC_BUILD_SUBPROJECT: 1
   needs:
     - fedora:rawhide@container-prep
-meson-install-shared:
-  stage: test
-  extends:
-    - .test_hook@template
-    - .fdo.distribution-image@fedora
-    - .fc_artifacts
-  variables:
-    FC_DISTRO_NAME: fedora
-    FDO_DISTRIBUTION_VERSION: rawhide
-    FDO_DISTRIBUTION_TAG: $FEDORA_TAG
-    FC_TEST_EXEC: meson-install-shared
-  needs:
-    - fedora:rawhide@container-prep
-    - build-meson shared libxml2
-meson-install-static:
-  stage: test
-  extends:
-    - .test_hook@template
-    - .fdo.distribution-image@fedora
-    - .fc_artifacts
-  variables:
-    FC_DISTRO_NAME: fedora
-    FDO_DISTRIBUTION_VERSION: rawhide
-    FDO_DISTRIBUTION_TAG: $FEDORA_TAG
-    FC_TEST_EXEC: meson-install-static
-  needs:
-    - fedora:rawhide@container-prep
-    - build-meson static libxml2
 ASAN/UBSAN:
   stage: test
   extends:
@@ -616,6 +610,22 @@ ASAN/UBSAN:
     FC_BUILDSYS: meson
     FC_BUILD_TYPE: shared
     FC_BUILD_ASAN: address,undefined
+  needs:
+    - fedora:rawhide@container-prep
+TSAN:
+  stage: test
+  extends:
+    - .build@template
+    - .fdo.distribution-image@fedora
+    - .fc_artifacts
+  variables:
+    FC_DISTRO_NAME: fedora
+    FDO_DISTRIBUTION_VERSION: rawhide
+    FDO_DISTRIBUTION_TAG: $FEDORA_TAG
+    FC_TEST_EXEC: TSAN
+    FC_BUILDSYS: meson
+    FC_BUILD_TYPE: shared
+    FC_BUILD_ASAN: thread
   needs:
     - fedora:rawhide@container-prep
 
@@ -656,8 +666,8 @@ apicheck:
     - fedora:rawhide@container-prep
     - build-meson shared libxml2
   script:
+    - pip install junit_xml
     - |
-      pip install junit_xml
       export builddir=($(pwd)/build-fontconfig-*)
       python3 .gitlab-ci/apicheck.py -f .gitlab-ci/symbol.list -o "${builddir[0]}/apicheck.xml" "${builddir[0]}/libfontconfig.so" src/fcint.h "${builddir[0]}/fontconfig/fontconfig.h" fontconfig/fcfontations.h fontconfig/fcfreetype.h
   rules:
@@ -688,8 +698,6 @@ t_alpine:edge:standard build:
     FC_BUILD_TYPE: shared
     FC_XML_BACKEND: expat
     FC_BUILD_DISABLED: nls
-  needs:
-    - 'alpine:edge@container-prep'
 
 
 t_fedora:rawhide:standard build:
@@ -706,8 +714,22 @@ t_fedora:rawhide:standard build:
     FC_BUILD_TYPE: shared
     FC_XML_BACKEND: libxml2
     FC_BUILD_DISTCHECK: 1
-  needs:
-    - 'fedora:rawhide@container-prep'
+
+
+t_fedora:45:standard build:
+  stage: distro
+  extends:
+    - .build@template
+    - .fdo.distribution-image@fedora
+    - .fc_artifacts
+  variables:
+    FC_DISTRO_NAME: fedora
+    FDO_DISTRIBUTION_VERSION: '45'
+    FDO_DISTRIBUTION_TAG: $FEDORA_TAG
+    FC_BUILDSYS: meson
+    FC_BUILD_TYPE: shared
+    FC_XML_BACKEND: libxml2
+    FC_BUILD_DISTCHECK: 1
 
 
 t_fedora:44:standard build:
@@ -724,45 +746,6 @@ t_fedora:44:standard build:
     FC_BUILD_TYPE: shared
     FC_XML_BACKEND: libxml2
     FC_BUILD_DISTCHECK: 1
-  needs:
-    - 'fedora:44@container-prep'
-
-
-t_fedora:43:standard build:
-  stage: distro
-  extends:
-    - .build@template
-    - .fdo.distribution-image@fedora
-    - .fc_artifacts
-  variables:
-    FC_DISTRO_NAME: fedora
-    FDO_DISTRIBUTION_VERSION: '43'
-    FDO_DISTRIBUTION_TAG: $FEDORA_TAG
-    FC_BUILDSYS: meson
-    FC_BUILD_TYPE: shared
-    FC_XML_BACKEND: libxml2
-    FC_BUILD_DISTCHECK: 1
-  needs:
-    - 'fedora:43@container-prep'
-
-
-t_fedora:rawhide:MinGW:
-  stage: distro
-  extends:
-    - .build@template
-    - .fdo.distribution-image@fedora
-    - .fc_artifacts
-  variables:
-    FC_DISTRO_NAME: fedora
-    FDO_DISTRIBUTION_VERSION: 'rawhide'
-    FDO_DISTRIBUTION_TAG: $FEDORA_TAG
-    FC_BUILDSYS: meson
-    FC_BUILD_TYPE: static
-    FC_BUILD_PLATFORM: mingw
-    FC_BUILD_ARCH: linux-mingw-w64-64bit
-    FC_BUILD_NO_INSTALL: 1
-  needs:
-    - 'fedora:rawhide@container-prep'
 
 
 t_fedora:rawhide:android aarch64:
@@ -783,11 +766,9 @@ t_fedora:rawhide:android aarch64:
     FC_BUILD_NO_INSTALL: 1
     FC_BUILD_DISABLED: nls
     FC_BUILD_NO_CHECK: 1
-  needs:
-    - 'fedora:rawhide@container-prep'
 
 
-t_freebsd:14.3:standard build:
+t_freebsd:14.4:standard build:
   stage: distro
   extends:
     - .build-in-qemu@template
@@ -795,14 +776,49 @@ t_freebsd:14.3:standard build:
     - .fc_artifacts
   variables:
     FC_DISTRO_NAME: freebsd
-    FDO_DISTRIBUTION_VERSION: '14.3'
+    FDO_DISTRIBUTION_VERSION: '14.4'
     FDO_DISTRIBUTION_TAG: $FREEBSD_TAG
     FC_BUILDSYS: meson
     FC_BUILD_TYPE: shared
     FC_XML_BACKEND: libxml2
     FC_BUILD_NO_CHECK: 1
-  needs:
-    - 'freebsd:14.3@container-prep'
+
+
+t_msys2:latest:UCRT64:
+  stage: distro
+  extends:
+    - .build@template
+    - .fdo.distribution-image@msys2
+    - .fc_artifacts
+  variables:
+    FC_DISTRO_NAME: msys2
+    FDO_DISTRIBUTION_VERSION: 'latest'
+    FDO_DISTRIBUTION_TAG: $MSYS2_TAG
+    FC_BUILDSYS: meson
+    FC_BUILD_TYPE: static
+    FC_XML_BACKEND: expat
+    FC_BUILD_DISABLED: nls iconv
+    FC_BUILD_NO_VENV: 1
+    FC_BUILD_SH: msys2 -c
+
+
+t_msys2:latest:MINGW64:
+  stage: distro
+  extends:
+    - .build@template
+    - .fdo.distribution-image@msys2
+    - .fc_artifacts
+  variables:
+    FC_DISTRO_NAME: msys2
+    FDO_DISTRIBUTION_VERSION: 'latest'
+    FDO_DISTRIBUTION_TAG: $MSYS2_TAG
+    FC_BUILDSYS: meson
+    FC_BUILD_TYPE: static
+    FC_XML_BACKEND: expat
+    FC_BUILD_DISABLED: nls iconv
+    FC_BUILD_NO_VENV: 1
+    FC_BUILD_SH: msys2 -c
+    MSYSTEM: MINGW64
 
 
 #######################################
@@ -859,7 +875,7 @@ make-release:
   variables:
     PACKAGE_REGISTRY_URL: "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/fontconfig/${CI_COMMIT_TAG}"
   script:
-    - glab auth login -h ${CI_SERVER_HOST} -j ${CI_JOB_TOKEN}
+    - glab auth login --hostname ${CI_SERVER_HOST} --job-token ${CI_JOB_TOKEN}
     - |
       glab changelog generate -v ${CI_COMMIT_TAG} > changelog-${CI_COMMIT_TAG}.md
       glab release create ${CI_COMMIT_TAG} --name "Release ${CI_COMMIT_TAG}" -F changelog-${CI_COMMIT_TAG}.md -a "[{\"name\": \"fontconfig-${CI_COMMIT_TAG}.tar.xz\", \"url\": \"${PACKAGE_REGISTRY_URL}/fontconfig-${CI_COMMIT_TAG}.tar.xz\"}, {\"name\": \"fontconfig-${CI_COMMIT_TAG}.tar.xz (sha256sum)\", \"url\": \"${PACKAGE_REGISTRY_URL}/fontconfig-${CI_COMMIT_TAG}.tar.xz.sha256sum\"}]"

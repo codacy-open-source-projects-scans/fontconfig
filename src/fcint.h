@@ -56,6 +56,10 @@
 #include <sys/types.h>
 #include <time.h>
 
+#ifdef HAVE_XLOCALE_H
+#include <xlocale.h>
+#endif
+
 #include "fcatomic.h"
 #include "fcdeprecate.h"
 #include "fcmutex.h"
@@ -405,15 +409,16 @@ struct _FcCharSet {
     intptr_t numbers_offset;
 };
 
-#define FcCharSetLeaves(c)  FcOffsetMember (c, leaves_offset, intptr_t)
-#define FcCharSetLeaf(c, i) (FcOffsetToPtr (FcCharSetLeaves (c),    \
-                                            FcCharSetLeaves (c)[i], \
-                                            FcCharLeaf))
+#define FcCharSetLeaves(c)           FcOffsetMember (c, leaves_offset, intptr_t)
+#define FcCharSetLeaf(c, i)          (FcOffsetToPtr (FcCharSetLeaves (c),    \
+                                                     FcCharSetLeaves (c)[i], \
+                                                     FcCharLeaf))
 #define FcCharSetNumbers(c)          FcOffsetMember (c, numbers_offset, FcChar16)
 
 #define FCSS_DEFAULT                 0 /* default behavior */
 #define FCSS_ALLOW_DUPLICATES        1 /* allows for duplicate strings in the set */
 #define FCSS_GROW_BY_64              2 /* grows buffer by 64 elements instead of 1 */
+#define FCSS_TRIPLE                  4 /* allow storing triples in storage */
 
 #define FcStrSetHasControlBit(s, c)  (s->control & c)
 #define FcStrSetHasControlBits(s, c) ((c) == (s->control & (c)))
@@ -454,9 +459,9 @@ struct _FcCache {
     intptr_t     dirs;       /* offset to subdirs */
     int          dirs_count; /* number of subdir strings */
     int          pad1;
-    intptr_t     set;      /* offset to font set */
-    int          checksum; /* checksum of directory state */
-    int          pad2;
+    intptr_t     set;           /* offset to font set */
+    uint32_t     checksum;      /* lower 32 bits of st_mtime */
+    uint32_t     checksum_hi;   /* upper 32 bits of st_mtime */
     int64_t      checksum_nano; /* checksum of directory state */
     int64_t      fc_version;    /* fontconfig version */
 };
@@ -600,6 +605,7 @@ struct _FcConfig {
      * match preferrentially
      */
     FcFontSet *fonts[FcSetApplication + 1];
+    FcRwLock   fonts_lock;
     /*
      * Fontconfig can periodically rescan the system configuration
      * and font directories.  This rescanning occurs when font
@@ -628,6 +634,10 @@ struct _FcConfig {
     FcStrSet *default_langs; /* String sets of the default languages */
     FcChar8  *prgname;       /* Program name of current process */
     FcChar8  *desktop_name;  /* Current desktop name */
+
+    int warns; /* Bitfield of warning flags (FC_WARN_*) controlling which warnings to emit */
+
+    FcStrSet *appFonts; /* List of Application-specific font files/directories */
 };
 
 typedef struct _FcFileTime {
@@ -829,10 +839,6 @@ FcPrivate FcBool
 FcConfigGlobAdd (FcConfig      *config,
                  const FcChar8 *glob,
                  FcBool         accept);
-
-FcPrivate FcBool
-FcConfigAcceptFilename (FcConfig      *config,
-                        const FcChar8 *filename);
 
 FcPrivate FcBool
 FcConfigPatternsAdd (FcConfig  *config,
@@ -1212,6 +1218,11 @@ FcFileScanConfig (FcFontSet     *set,
                   FcConfig      *config);
 
 FcPrivate FcBool
+FcFileScanFontFile (FcFontSet     *set,
+                    const FcChar8 *file,
+                    FcConfig      *config);
+
+FcPrivate FcBool
 FcDirScanConfig (FcFontSet     *set,
                  FcStrSet      *dirs,
                  const FcChar8 *dir,
@@ -1221,6 +1232,15 @@ FcDirScanConfig (FcFontSet     *set,
 /* fcfont.c */
 FcPrivate int
 FcFontDebug (void);
+
+/* fcfreetype.c */
+FcPrivate int
+FcSpacingClassify (const int *value,
+                   const int *count,
+                   int        num,
+                   int        total,
+                   FcBool     overflow,
+                   FcBool     ascii_monospaced);
 
 /* fcfs.c */
 
@@ -1232,6 +1252,23 @@ FcFontSetSerialize (FcSerialize *serialize, const FcFontSet *s);
 
 FcPrivate FcFontSet *
 FcFontSetDeserialize (const FcFontSet *set);
+
+/* fcgenericalias.c */
+FcPrivate uint32_t
+FcGenericAliasGetClassification (const char *family);
+
+/* Max number of generic values a font can carry (classification bits
+ * 0..FC_FAMILY_FANGSONG-1); keep tied to the last FC_FAMILY_* value in
+ * fontconfig.h. */
+#define FC_GENERIC_FAMILY_MAX_VALUES FC_FAMILY_FANGSONG
+
+typedef struct _FcGenericFamilyValues {
+    int values[FC_GENERIC_FAMILY_MAX_VALUES];
+    int n;
+} FcGenericFamilyValues;
+
+FcPrivate FcGenericFamilyValues
+FcGenericFamilyGetValues (FcValueListPtr families);
 
 /* fcplist.c */
 FcPrivate FcPtrList *
@@ -1270,6 +1307,13 @@ FcPtrListIterRemove (FcPtrList     *list,
                      FcPtrListIter *iter);
 
 /* fcinit.c */
+#ifdef ENABLE_TEST_HOOKS
+extern FcPrivate fc_atomic_int_t FcConfigInitCount;
+#endif
+
+FcPrivate FcConfig *
+FcInitReinitializeWith (FcConfig *config);
+
 FcPrivate FcConfig *
 FcInitLoadOwnConfig (FcConfig *config);
 

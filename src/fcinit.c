@@ -73,6 +73,10 @@ FcInitFallbackConfigWithFilter (FcConfig *config, const FcChar8 *sysroot)
 {
     FcConfig *fallback = FcInitFallbackConfig (sysroot);
 
+    if (!fallback) {
+	FcConfigDestroy (config);
+	return NULL;
+    }
     /* Copy filter data */
     fallback->filter_func = config->filter_func;
     fallback->filter_data = config->filter_data;
@@ -192,9 +196,20 @@ FcInitLoadOwnConfigAndFonts (FcConfig *config)
     return config;
 }
 
+#ifdef ENABLE_TEST_HOOKS
+/* Counts how many times the default configuration has been fully built.
+ * Test-only hook (see test-mt-fcinit) to assert that concurrent lazy
+ * initialization builds the default config exactly once. Not compiled
+ * into production builds. */
+fc_atomic_int_t FcConfigInitCount;
+#endif
+
 FcConfig *
 FcInitLoadConfigAndFonts (void)
 {
+#ifdef ENABLE_TEST_HOOKS
+    fc_atomic_int_add (FcConfigInitCount, 1);
+#endif
     return FcInitLoadOwnConfigAndFonts (NULL);
 }
 
@@ -223,10 +238,14 @@ FcFini (void)
 FcBool
 FcInitReinitialize (void)
 {
-    FcConfig *config;
+    FcConfig *config, *old_config;
     FcBool    ret;
 
-    config = FcInitLoadConfigAndFonts();
+    old_config = FcConfigReference (NULL);
+    if (!old_config)
+	return FcFalse;
+    config = FcInitReinitializeWith (old_config);
+    FcConfigDestroy (old_config);
     if (!config)
 	return FcFalse;
     ret = FcConfigSetCurrent (config);
@@ -234,6 +253,48 @@ FcInitReinitialize (void)
      * decrease it here to avoid the memory leak.
      */
     FcConfigDestroy (config);
+
+    return ret;
+}
+
+FcConfig *
+FcInitReinitializeWith (FcConfig *config)
+{
+    FcConfig      *ret;
+    FcStrList     *l;
+    const FcChar8 *s;
+
+    ret = FcInitLoadOwnConfig (NULL);
+    if (!ret)
+	return NULL;
+    if (!FcConfigBuildFonts (ret)) {
+	FcConfigDestroy (ret);
+	return NULL;
+    }
+    /* inherit application specific fonts only */
+    l = FcStrListCreate (config->appFonts);
+    if (!l) {
+	FcConfigDestroy (ret);
+	return NULL;
+    }
+    while ((s = FcStrListNext (l))) {
+	if (FcFileIsFile (s)) {
+	    if (!FcConfigAppFontAddFile (ret, s)) {
+		fprintf (stderr, "Fontconfig warning: failed to re-add an application font: %s\n",
+		         (const char *)s);
+	    }
+	} else if (FcFileIsDir (s)) {
+	    if (!FcConfigAppFontAddDir (ret, s)) {
+		FcStrListDone (l);
+		FcConfigDestroy (ret);
+		return NULL;
+	    }
+	} else {
+	    fprintf (stderr, "Fontconfig warning: failed to re-add an application font: %s\n",
+	             (const char *)s);
+	}
+    }
+    FcStrListDone (l);
 
     return ret;
 }

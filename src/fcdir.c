@@ -70,10 +70,10 @@ FcFileIsFile (const FcChar8 *file)
     return S_ISREG (statb.st_mode);
 }
 
-static FcBool
-FcFileScanFontConfig (FcFontSet     *set,
-                      const FcChar8 *file,
-                      FcConfig      *config)
+FcBool
+FcFileScanFontFile (FcFontSet     *set,
+                    const FcChar8 *file,
+                    FcConfig      *config)
 {
     int            i;
     FcBool         ret = FcTrue;
@@ -117,6 +117,10 @@ FcFileScanFontConfig (FcFontSet     *set,
 	    if (FcPatternObjectGetString (font, FC_FILE_OBJECT, 0, &f) == FcResultMatch &&
 	        strncmp ((const char *)f, (const char *)sysroot, len) == 0) {
 		FcChar8 *s = FcStrCopy (f);
+		if (!s) {
+		    ret = FcFalse;
+		    break;
+		}
 		FcPatternObjectDel (font, FC_FILE_OBJECT);
 		if (s[len] != '/')
 		    len--;
@@ -166,7 +170,7 @@ FcFileScanConfig (FcFontSet     *set,
 	return FcStrSetAdd (dirs, d);
     } else {
 	if (set)
-	    return FcFileScanFontConfig (set, file, config);
+	    return FcFileScanFontFile (set, file, config);
 	else
 	    return FcTrue;
     }
@@ -337,6 +341,11 @@ FcDirCacheScan (const FcChar8 *dir, FcConfig *config)
     int fd = -1;
 #endif
 
+    if (!FcConfigAcceptFilename (config, dir)) {
+	if (FcDebug() & FC_DBG_CACHE)
+	    printf ("%s: skipping, matching with deny list\n", dir);
+	return NULL;
+    }
     if (sysroot)
 	d = FcStrBuildFilename (sysroot, dir, NULL);
     else

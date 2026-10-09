@@ -99,7 +99,20 @@ FcStrtod (char *s, char **end)
 FcChar8 *
 FcStrCopy (const FcChar8 *s)
 {
-#ifdef HAVE_STRDUP
+#ifdef HAVE_POSIX_MEMALIGN
+    /* See https://gitlab.freedesktop.org/fontconfig/fontconfig/-/work_items/569 */
+    size_t len = strlen ((const char *)s) + 1;
+    void  *ret;
+
+    if (posix_memalign (&ret, sizeof (void *), len) != 0)
+	return NULL;
+
+    return (FcChar8 *)memcpy (ret, s, len);
+#elif defined(HAVE_STRDUP)
+    /* Win32 doesn't have posix_memalign nor aligned_alloc.
+     * However, their allocator returns pointers that are
+     * always suitably aligned.
+     */
     return (FcChar8 *)strdup ((const char *)s);
 #else
     FcChar8 *ret;
@@ -1285,6 +1298,8 @@ FcConvertDosPath (char *str)
 FcChar8 *
 FcStrCanonFilename (const FcChar8 *s)
 {
+    if (!s)
+	return NULL;
 #ifdef _WIN32
     FcChar8 full[FC_MAX_FILE_LEN + 2];
     int     size = GetFullPathName ((LPCSTR)s, sizeof (full) - 1,
@@ -1306,6 +1321,8 @@ FcStrCanonFilename (const FcChar8 *s)
 	if (getcwd ((char *)cwd, FC_MAX_FILE_LEN) == NULL)
 	    return NULL;
 	full = FcStrBuildFilename (cwd, s, NULL);
+	if (!full)
+	    return NULL;
 	file = FcStrCanonAbsoluteFilename (full);
 	FcStrFree (full);
 	return file;
@@ -1451,7 +1468,11 @@ FcStrSetEqual (FcStrSet *sa, FcStrSet *sb)
 FcBool
 FcStrSetAdd (FcStrSet *set, const FcChar8 *s)
 {
-    FcChar8 *newp = FcStrCopy (s);
+    FcChar8 *newp;
+
+    if (FcStrSetHasControlBit (set, FCSS_TRIPLE))
+	return FcFalse;
+    newp = FcStrCopy (s);
     if (!newp)
 	return FcFalse;
     if (!_FcStrSetInsert (set, newp, set->num)) {
@@ -1464,7 +1485,11 @@ FcStrSetAdd (FcStrSet *set, const FcChar8 *s)
 FcBool
 FcStrSetInsert (FcStrSet *set, const FcChar8 *s, int pos)
 {
-    FcChar8 *newp = FcStrCopy (s);
+    FcChar8 *newp;
+
+    if (FcStrSetHasControlBit (set, FCSS_TRIPLE))
+	return FcFalse;
+    newp = FcStrCopy (s);
     if (!newp)
 	return FcFalse;
     if (!_FcStrSetInsert (set, newp, pos)) {
@@ -1477,7 +1502,12 @@ FcStrSetInsert (FcStrSet *set, const FcChar8 *s, int pos)
 FcBool
 FcStrSetAddTriple (FcStrSet *set, const FcChar8 *a, const FcChar8 *b, const FcChar8 *c)
 {
-    FcChar8 *newp = FcStrMakeTriple (a, b, c);
+    FcChar8 *newp;
+
+    if (!FcStrSetHasControlBit (set, FCSS_TRIPLE)) {
+	return FcFalse;
+    }
+    newp = FcStrMakeTriple (a, b, c);
     if (!newp)
 	return FcFalse;
     if (!_FcStrSetInsert (set, newp, set->num)) {
@@ -1511,7 +1541,11 @@ FcStrTripleThird (FcChar8 *str)
 FcBool
 FcStrSetAddFilename (FcStrSet *set, const FcChar8 *s)
 {
-    FcChar8 *newp = FcStrCopyFilename (s);
+    FcChar8 *newp;
+
+    if (FcStrSetHasControlBit (set, FCSS_TRIPLE))
+	return FcFalse;
+    newp = FcStrCopyFilename (s);
     if (!newp)
 	return FcFalse;
     if (!_FcStrSetInsert (set, newp, set->num)) {
@@ -1680,7 +1714,7 @@ FcStrListFirst (FcStrList *list)
 FcChar8 *
 FcStrListNext (FcStrList *list)
 {
-    if (list->n >= list->set->num)
+    if (!list || list->n >= list->set->num)
 	return 0;
     return list->set->strs[list->n++];
 }

@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/bin/bash
 # fontconfig/new-version.sh
 #
 # Copyright © 2000 Keith Packard
@@ -36,13 +36,23 @@ case "$version" in
 	;;
 esac
 
-eval `echo $version | 
+eval `echo $version |
 	awk -F. '{ printf ("major=%d\nminor=%d\nrevision=%d\n",
 			   $1, $2, $3); }'`
-			   
-# Update the version numbers
 
-sed -i configure.ac -e "/^AC_INIT(/s/2\.[0-9.]*/$version/"
+cachever=$(grep -e "^cacheversion" meson.build | sed -E "s/cacheversion\s*=\s*([0-9]*)/\1/")
+cachesnap=$(grep -e "^cachesnapversion" meson.build | sed -E "s/cachesnapversion\s*=\s*([0-9]*)/\1/")
+if [ "$cachesnap" -gt 0 ]; then
+    oldcachever=$cachever
+    ((cachever++))
+    cachesnap=0
+    # Update cache version and reset min compat to previous version
+    sed -i meson.build -e "/^cacheversion/s/[0-9]\+/$cachever/" \
+        -e "/^cachemincompat/s/[0-9]\+/$oldcachever/" \
+        -e "/^cachesnapversion/s/[0-9]\+/$cachesnap/"
+fi
+
+# Update the version numbers
 
 sed -i fontconfig/fontconfig.h.in \
 	-e "/^#define FC_MAJOR/s/[0-9][0-9]*/$major/" \
@@ -54,15 +64,15 @@ sed -i meson.build -e "/version: /s/2\.[0-9.]*/$version/"
 #
 # Compute pretty form of new version number
 #
-version_note=`echo $version | awk -F. '{ 
-	if ($3 > 90) 
+version_note=`echo $version | awk -F. '{
+	if ($3 > 90)
 		printf ("%d.%d.%d (%d.%d RC%d)\n",
 			$1, $2, $3, $1, $2 + 1, $3 - 90);
 	else if ($3 == 0)
 		printf ("%d.%d\n", $1, $2);
 	else
 		printf ("%d.%d.%d\n", $1, $2, $3); }'`
-		
+
 #
 # Find previous version in NEWS
 #
@@ -88,7 +98,7 @@ date=`date '+%Y-%m-%d'`
 
 #
 # Update the readme file
-# 
+#
 if [ $version != $last ]; then
 	#
 	# header
@@ -102,33 +112,32 @@ if [ $version != $last ]; then
 				space=(70 - length) / 2;
 				for (i = 0; i < space; i++)
 					printf (" ");
-				print 
+				print
 				next
-			      } 
-			      { 
-				print 
+			      }
+			      {
+				print
 			      }'
-	
+
 	#
 	# changelog
 	#
-	
+
 	echo $version_note
 	echo
 	git log --no-merges --pretty=short $last.. | git shortlog | cat
-	
+
 	#
 	# previous changelogs
 	#
-	
+
 	sed -n '/^2\.[0-9.]*/,$p' NEWS) > NEWS.tmp ||
 		(echo "NEWS update failed"; exit 1)
-	
+
 	mv NEWS.tmp NEWS
 fi
 
 $test git commit -m"Bump version to $version" \
-	configure.ac \
 	fontconfig/fontconfig.h.in \
 	meson.build \
 	NEWS
@@ -139,4 +148,3 @@ $test git tag -s -m "Version $version" $version
 # Make distributed change log
 
 git log --stat $last.. > ChangeLog-$version
-

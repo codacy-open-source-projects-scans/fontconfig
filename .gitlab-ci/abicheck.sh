@@ -4,6 +4,7 @@ set -ex
 set -o pipefail
 
 cihomedir=$(dirname "$0")
+shift
 basedir=$(realpath "$cihomedir/..")
 newbuilddir=${1-$(realpath "$basedir/build")}
 basebuilddir=$(realpath "$basedir/.build.base")
@@ -43,7 +44,13 @@ fi
 
 # assume that the targeted build directory is up-to-date.
 if [ ! -d "$newbuilddir" ]; then
-    "$cihomedir/build.sh" "$@"
+    buildcmd=(python3 $cihomedir/build.py)
+    if [ ! -f "$cihomedir/build.py" ]; then
+        buildcmd=($cihomedir/build.sh)
+    else
+        buildcmd=(python3 $cihomedir/build.py)
+    fi
+    ${buildcmd[@]} "$@"
 fi
 copyresult "$newbuilddir" "new"
 
@@ -58,11 +65,16 @@ git fetch origin main
 
 git worktree add -b "abicheck_main_$curbranch" "$basebuilddir" FETCH_HEAD
 pushd "$basebuilddir"
+if [ ! -f "$cihomedir/build.py" ]; then
+    buildcmd=($cihomedir/build.sh)
+else
+    buildcmd=(python3 $cihomedir/build.py)
+fi
 # Do not run unit tests because main branch should be passed by CI
-BUILDLOG="$newbuilddir/fc-basebuild.log" BUILDDIR="$basebuilddir/build" "$cihomedir/build.sh" -C "$@"
+BUILDLOG="$newbuilddir/fc-basebuild.log" BUILDDIR="$basebuilddir/build" ${buildcmd[@]} -C "$@"
 popd
 
 copyresult "$basebuilddir/build" "old"
 cp -L "$basebuilddir/build/libfontconfig-old.so" "$newbuilddir"
 
-abidiff --no-added-syms "$newbuilddir/libfontconfig-old.so" "$newbuilddir/libfontconfig-new.so" | python3 ./.gitlab-ci/abidiff2xml.py -o "$newbuilddir/abidiff.xml" -
+abidiff --no-added-syms --suppressions $cihomedir/.abidiff "$newbuilddir/libfontconfig-old.so" "$newbuilddir/libfontconfig-new.so" | python3 ./.gitlab-ci/abidiff2xml.py -o "$newbuilddir/abidiff.xml" -

@@ -165,6 +165,41 @@ FcCompareBool (const FcValue *v1, const FcValue *v2, FcValue *bestValue)
 }
 
 static double
+FcCompareEqual (const FcValue *value1, const FcValue *value2, FcValue *bestValue)
+{
+    double v1, v2, v;
+
+    switch ((int)value1->type) {
+    case FcTypeInteger:
+	v1 = (double)value1->u.i;
+	break;
+    case FcTypeDouble:
+	v1 = value1->u.d;
+	break;
+    case FcTypeBool:
+	return FcCompareBool (value1, value2, bestValue);
+    default:
+	return -1.0;
+    }
+    switch ((int)value2->type) {
+    case FcTypeInteger:
+	v2 = (double)value2->u.i;
+	break;
+    case FcTypeDouble:
+	v2 = value2->u.d;
+	break;
+    case FcTypeBool:
+	return FcCompareBool (value1, value2, bestValue);
+    default:
+	return -1.0;
+    }
+    v = !(v1 == v2);
+    *bestValue = FcValueCanonicalize (value2);
+
+    return v;
+}
+
+static double
 FcCompareCharSet (const FcValue *v1, const FcValue *v2, FcValue *bestValue)
 {
     *bestValue = FcValueCanonicalize (v2); /* TODO Improve. */
@@ -296,6 +331,7 @@ FcCompareFilename (const FcValue *v1, const FcValue *v2, FcValue *bestValue)
 #define PRI_FcCompareFamily(n)     PRI1 (n)
 #define PRI_FcCompareString(n)     PRI1 (n)
 #define PRI_FcCompareNumber(n)     PRI1 (n)
+#define PRI_FcCompareEqual(n)      PRI1 (n)
 #define PRI_FcCompareBool(n)       PRI1 (n)
 #define PRI_FcCompareFilename(n)   PRI1 (n)
 #define PRI_FcCompareCharSet(n)    PRI1 (n)
@@ -330,8 +366,8 @@ typedef enum _FcMatcherPriority {
     PRI1 (COLOR),
     PRI1 (FOUNDRY),
     PRI1 (CHARSET),
-    PRI1 (GENERIC_FAMILY),
     PRI_FAMILY_STRONG,
+    PRI1 (GENERIC_FAMILY),
     PRI_POSTSCRIPT_NAME_STRONG,
     PRI1 (LANG),
     PRI_FAMILY_WEAK,
@@ -496,7 +532,7 @@ FcCompareDataClear (FcCompareData *data)
     FcHashTableDestroy (data->family_hash);
 }
 
-static void
+static FcBool
 FcCompareDataInit (FcPattern     *pat,
                    FcCompareData *data)
 {
@@ -513,6 +549,8 @@ FcCompareDataInit (FcPattern     *pat,
                                NULL,
                                NULL,
                                free);
+    if (!table)
+	return FcFalse;
 
     elt = FcPatternObjectFindElt (pat, FC_FAMILY_OBJECT);
     if (elt) {
@@ -520,6 +558,10 @@ FcCompareDataInit (FcPattern     *pat,
 	    key = FcValueString (&l->value);
 	    if (!FcHashTableFind (table, key, (void **)&e)) {
 		e = malloc (sizeof (FamilyEntry));
+		if (!e) {
+		    FcHashTableDestroy (table);
+		    return FcFalse;
+		}
 		e->strong_value = 1e99;
 		e->weak_value = 1e99;
 		FcHashTableAdd (table, (void *)key, e);
@@ -535,6 +577,7 @@ FcCompareDataInit (FcPattern     *pat,
     }
 
     data->family_hash = table;
+    return FcTrue;
 }
 
 static FcBool
@@ -578,6 +621,37 @@ FcCompareFamilies (FcPattern     *pat,
     value[PRI_FAMILY_WEAK] = weak_value;
 
     return FcTrue;
+}
+
+/*
+ * Fonts loaded from caches that predate the genericfamily object
+ * (issue #562) carry no FC_GENERIC_FAMILY element, so the merge-join
+ * below would skip that dimension and hand them an unearned perfect
+ * score.  Re-derive the value from the font's family (curated
+ * classification only) and score it as if the scanner had stored it,
+ * so an old-cache font matches like a freshly scanned one.
+ */
+static FcBool
+FcCompareGenericFamilyBackfill (FcValueListPtr query, /* pattern genericfamily */
+                                FcPattern     *fnt,
+                                double        *value,
+                                FcResult      *result)
+{
+    const FcMatcher      *match = FcObjectToMatcher (FC_GENERIC_FAMILY_OBJECT, FcFalse);
+    FcPatternElt         *fam = FcPatternObjectFindElt (fnt, FC_FAMILY_OBJECT);
+    FcGenericFamilyValues g;
+    FcValueList           vl[FC_GENERIC_FAMILY_MAX_VALUES];
+    int                   k;
+
+    g = FcGenericFamilyGetValues (fam ? FcPatternEltValues (fam) : NULL);
+    for (k = 0; k < g.n; k++) {
+	vl[k].value.type = FcTypeInteger;
+	vl[k].value.u.i = g.values[k];
+	vl[k].binding = FcValueBindingStrong;
+	vl[k].next = (k + 1 < g.n) ? &vl[k + 1] : NULL;
+    }
+    return FcCompareValueList (FC_GENERIC_FAMILY_OBJECT, match,
+                               query, vl, NULL, value, NULL, result);
 }
 
 /*
@@ -627,6 +701,26 @@ FcCompare (FcPattern     *pat,
 	    i2++;
 	}
     }
+
+    /*
+     * genericfamily is derivable from the family name, so reconstruct it
+     * for fonts loaded from caches that predate the object rather than
+     * leaving it unscored (issue #562).  This is done outside the
+     * merge-join because the loop can exit before reaching a trailing
+     * query object that the font lacks.
+     * NOTE: when missing-object vs not-matched scoring is unified, this
+     * reconstruction must run before the missing-object policy so
+     * derivable objects are treated as present, not absent.
+     */
+    {
+	FcPatternElt *q_gf = FcPatternObjectFindElt (pat, FC_GENERIC_FAMILY_OBJECT);
+
+	if (q_gf && !FcPatternObjectFindElt (fnt, FC_GENERIC_FAMILY_OBJECT) &&
+	    !FcCompareGenericFamilyBackfill (FcPatternEltValues (q_gf),
+	                                     fnt, value, result))
+	    return FcFalse;
+    }
+
     return FcTrue;
 }
 
@@ -831,7 +925,8 @@ FcFontSetMatchInternal (FcFontSet **sets,
 	FcPatternPrint (p);
     }
 
-    FcCompareDataInit (p, &data);
+    if (!FcCompareDataInit (p, &data))
+	return 0;
 
     for (set = 0; set < nsets; set++) {
 	s = sets[set];
@@ -1001,6 +1096,7 @@ FcFontMatch (FcConfig  *config,
     config = FcConfigReference (config);
     if (!config)
 	return NULL;
+    FcRwLockReadLock (&config->fonts_lock);
     nsets = 0;
     if (config->fonts[FcSetSystem])
 	sets[nsets++] = config->fonts[FcSetSystem];
@@ -1008,6 +1104,7 @@ FcFontMatch (FcConfig  *config,
 	sets[nsets++] = config->fonts[FcSetApplication];
 
     best = FcFontSetMatchInternal (sets, nsets, p, result);
+    FcRwLockUnlockRead (&config->fonts_lock);
     if (best) {
 	ret = FcFontRenderPrepare (config, p, best);
 	FcPatternDestroy (best);
@@ -1176,7 +1273,8 @@ FcFontSetSort (FcConfig   *config,
     nodeps = (FcSortNode **)(nodes + nnodes);
     patternLangSat = (FcBool *)(nodeps + nnodes);
 
-    FcCompareDataInit (p, &data);
+    if (!FcCompareDataInit (p, &data))
+	goto bail1;
 
     newp = nodes;
     nodep = nodeps;
@@ -1313,12 +1411,14 @@ FcFontSort (FcConfig   *config,
     config = FcConfigReference (config);
     if (!config)
 	return NULL;
+    FcRwLockReadLock (&config->fonts_lock);
     nsets = 0;
     if (config->fonts[FcSetSystem])
 	sets[nsets++] = config->fonts[FcSetSystem];
     if (config->fonts[FcSetApplication])
 	sets[nsets++] = config->fonts[FcSetApplication];
     ret = FcFontSetSort (config, sets, nsets, p, trim, csp, result);
+    FcRwLockUnlockRead (&config->fonts_lock);
     FcConfigDestroy (config);
 
     return ret;

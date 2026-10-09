@@ -36,12 +36,16 @@
 
 #  include <libxml/parser.h>
 
-#  define XML_Char                 xmlChar
-#  define XML_Parser               xmlParserCtxtPtr
-#  define XML_ParserFree           xmlFreeParserCtxt
-#  define XML_GetCurrentLineNumber xmlSAX2GetLineNumber
-#  define XML_GetErrorCode         xmlCtxtGetLastError
-#  define XML_ErrorString(Error)   (Error)->message
+#  define XML_Char                     xmlChar
+#  define XML_Parser                   xmlParserCtxtPtr
+#  define XML_ParserFree               xmlFreeParserCtxt
+#  define XML_GetCurrentLineNumber     xmlSAX2GetLineNumber
+#  define XML_GetErrorCode             xmlCtxtGetLastError
+#  define XML_ErrorString(Error)       (Error)->message
+#  define XML_ErrorCode(Error)         (Error)->code
+#  define XML_StopParser(parser, flag) xmlStopParser (parser)
+#  define XML_ERROR_ABORTED            XML_ERR_USER_STOP
+#  define XML_Error                    const xmlError *
 
 #else /* ENABLE_LIBXML2 */
 
@@ -54,6 +58,9 @@
 #  else
 #    include <expat.h>
 #  endif
+
+#  define XML_Error            enum XML_Error
+#  define XML_ErrorCode(Error) (Error)
 
 #endif /* ENABLE_LIBXML2 */
 
@@ -265,6 +272,126 @@ FcExprCreateOp (FcConfig *config, FcExpr *left, FcOp op, FcExpr *right)
 	e->u.tree.right = right;
     }
     return e;
+}
+
+static FcExpr *
+FcExprDup (FcConfig *config, const FcExpr *e)
+{
+    FcExpr *ret = NULL;
+
+    if (!e)
+	return NULL;
+    switch (FC_OP_GET_OP (e->op)) {
+    case FcOpInteger:
+	ret = FcExprCreateInteger (config, e->u.ival);
+	break;
+    case FcOpDouble:
+	ret = FcExprCreateDouble (config, e->u.dval);
+	break;
+    case FcOpString:
+	ret = FcExprCreateString (config, e->u.sval);
+	break;
+    case FcOpMatrix: {
+	FcExpr      *xx = NULL, *xy = NULL, *yx = NULL, *yy = NULL;
+	FcExprMatrix m;
+
+	xx = FcExprDup (config, e->u.mexpr->xx);
+	xy = FcExprDup (config, e->u.mexpr->xy);
+	yx = FcExprDup (config, e->u.mexpr->yx);
+	yy = FcExprDup (config, e->u.mexpr->yy);
+	if (!xx || !xy || !yx || !yy)
+	    goto bail_matrix;
+	m.xx = xx;
+	m.xy = xy;
+	m.yx = yx;
+	m.yy = yy;
+	ret = FcExprCreateMatrix (config, &m);
+	break;
+    bail_matrix:
+	if (xx)
+	    FcExprDestroy (xx);
+	if (xy)
+	    FcExprDestroy (xy);
+	if (yx)
+	    FcExprDestroy (yx);
+	if (yy)
+	    FcExprDestroy (yy);
+	break;
+    }
+    case FcOpRange:
+	ret = FcExprCreateRange (config, e->u.rval);
+	break;
+    case FcOpBool:
+	ret = FcExprCreateBool (config, e->u.bval);
+	break;
+    case FcOpCharSet:
+	ret = FcExprCreateCharSet (config, e->u.cval);
+	break;
+    case FcOpLangSet:
+	ret = FcExprCreateLangSet (config, e->u.lval);
+	break;
+    case FcOpNil:
+	ret = FcExprCreateNil (config);
+	break;
+    case FcOpField:
+	ret = FcExprCreateName (config, e->u.name);
+	break;
+    case FcOpConst:
+	ret = FcExprCreateConst (config, e->u.constant);
+	break;
+    case FcOpAssign:
+    case FcOpAssignReplace:
+    case FcOpPrependFirst:
+    case FcOpPrepend:
+    case FcOpAppend:
+    case FcOpAppendLast:
+    case FcOpDelete:
+    case FcOpDeleteAll:
+    case FcOpQuest:
+    case FcOpOr:
+    case FcOpAnd:
+    case FcOpEqual:
+    case FcOpNotEqual:
+    case FcOpContains:
+    case FcOpListing:
+    case FcOpNotContains:
+    case FcOpLess:
+    case FcOpLessEqual:
+    case FcOpMore:
+    case FcOpMoreEqual:
+    case FcOpPlus:
+    case FcOpMinus:
+    case FcOpTimes:
+    case FcOpDivide:
+    case FcOpNot:
+    case FcOpComma:
+    case FcOpFloor:
+    case FcOpCeil:
+    case FcOpRound:
+    case FcOpTrunc:
+    case FcOpInvalid: {
+	ret = FcConfigAllocExpr (config);
+	if (ret) {
+	    ret->op = e->op;
+	    ret->u.tree.left = FcExprDup (config, e->u.tree.left);
+	    ret->u.tree.right = NULL;
+	    if (e->u.tree.left && !ret->u.tree.left) {
+		FcExprDestroy (ret);
+		return NULL;
+	    }
+	    ret->u.tree.right = FcExprDup (config, e->u.tree.right);
+	    if (e->u.tree.right && !ret->u.tree.right) {
+		FcExprDestroy (ret);
+		return NULL;
+	    }
+	}
+	break;
+    }
+    default:
+	/* unlikely */
+	break;
+    }
+    return ret;
 }
 
 static void
@@ -593,6 +720,8 @@ typedef enum _FcConfigSeverity {
 
 static FcBool
 FcConfigLexBool (FcConfigParse *parse, const FcChar8 *bool_);
+static FcBool
+FcParseFontconfig (FcConfigParse *parse, const XML_Char **attr);
 
 static void
 FcConfigMessage (FcConfigParse *parse, FcConfigSeverity severe, const char *fmt, ...)
@@ -1069,6 +1198,10 @@ FcVStackPopAndDestroy (FcConfigParse *parse)
     case FcVStackName:
 	break;
     case FcVStackFamily:
+	/* Consumers hand off ownership by resetting the tag to FcVStackNone
+	 * before popping; anything still tagged FcVStackFamily here was never
+	 * taken over, so free it to avoid leaking the expr. */
+	FcExprDestroy (vstack->u.expr);
 	break;
     case FcVStackString:
     case FcVStackConstant:
@@ -1194,7 +1327,9 @@ FcPStackPush (FcConfigParse *parse, FcElement element, const XML_Char **attr)
 static FcBool
 FcPStackPop (FcConfigParse *parse)
 {
-    FcPStack *old;
+    FcPStack     *old;
+    static FcBool retrieved = FcFalse;
+    const char   *env = NULL;
 
     if (!parse->pstack) {
 	FcConfigMessage (parse, FcSevereError, "mismatching element");
@@ -1204,13 +1339,25 @@ FcPStackPop (FcConfigParse *parse)
     /* Don't check the attributes for FcElementNone */
     if (parse->pstack->element != FcElementNone &&
         parse->pstack->attr) {
-	/* Warn about unused attrs. */
-	FcChar8 **attrs = parse->pstack->attr;
-	while (*attrs) {
-	    if (attrs[0][0]) {
-		FcConfigMessage (parse, FcSevereWarning, "invalid attribute '%s'", attrs[0]);
+	if (!retrieved) {
+	    FcBool flag = FcFalse;
+
+	    env = getenv ("FONTCONFIG_WARN_INVALID_ATTRS");
+	    if (env && FcNameBool ((const FcChar8 *)env, &flag)) {
+		retrieved = FcTrue;
+		FcConfigSetWarningFlags (parse->config, FC_WARN_INVALID_ATTR, flag);
 	    }
-	    attrs += 2;
+	}
+	/* Warn only when a flag is turned on */
+	if (FcConfigGetWarningFlags (parse->config) & FC_WARN_INVALID_ATTR) {
+	    /* Warn about unused attrs. */
+	    FcChar8 **attrs = parse->pstack->attr;
+	    while (*attrs) {
+		if (attrs[0][0]) {
+		    FcConfigMessage (parse, FcSevereWarning, "invalid attribute '%s'", attrs[0]);
+		}
+		attrs += 2;
+	    }
 	}
     }
 
@@ -1413,12 +1560,60 @@ FcStartElement (void *userData, const XML_Char *name, const XML_Char **attr)
     element = FcElementMap (name);
     if (element == FcElementUnknown)
 	FcConfigMessage (parse, FcSevereWarning, "unknown element \"%s\"", name);
+    if (element == FcElementFontconfig) {
+	if (!FcParseFontconfig (parse, attr)) {
+	    XML_StopParser (parse->parser, XML_FALSE);
+	    return;
+	}
+	/* we don't parse anything for FcElementFontconfig in FcEndElement.
+	 * So do not add to the stack to avoid invalid attribute.
+	 */
+	return;
+    }
 
     if (!FcPStackPush (parse, element, attr)) {
 	FcConfigMessage (parse, FcSevereError, "out of memory");
 	return;
     }
     return;
+}
+
+static FcBool
+_check_fontconfig_version (FcConfigParse *parse, const char *versionstr)
+{
+    const char *p = versionstr;
+    int         vx = 0, vy = 0, vz = 0, confver;
+
+    while (isspace ((unsigned char)*p))
+	p++;
+    if (!isdigit ((unsigned char)*p) || sscanf (p, "%d.%d.%d", &vx, &vy, &vz) != 3) {
+	FcConfigMessage (parse, FcSevereWarning, "Invalid version format \"%s\"", versionstr);
+	return FcFalse;
+    }
+    confver = (vx * 10000) + (vy * 100) + vz;
+    if (FC_VERSION < confver) {
+	FcConfigMessage (parse, FcSevereInfo,
+	                 "Skipping due to version mismatch (current: %d.%d.%d, required: >= %s)",
+	                 FC_MAJOR, FC_MINOR, FC_REVISION, versionstr);
+	return FcFalse;
+    }
+    return FcTrue;
+}
+
+static FcBool
+FcParseFontconfig (FcConfigParse *parse, const XML_Char **attr)
+{
+    const XML_Char **p = attr;
+
+    if (!p)
+	return FcTrue;
+    while (*p) {
+	if (!strcmp ((char *)*p, "since")) {
+	    return _check_fontconfig_version (parse, (const char *)*(p + 1));
+	}
+	p += 2;
+    }
+    return FcTrue;
 }
 
 static void
@@ -1735,7 +1930,7 @@ FcParseLangSet (FcConfigParse *parse)
 	}
 	FcVStackPopAndDestroy (parse);
     }
- bail:
+bail:
     if (n > 0)
 	FcVStackPushLangSet (parse, langset);
     else
@@ -1821,18 +2016,214 @@ FcParseFamily (FcConfigParse *parse)
 	FcVStackPushExpr (parse, FcVStackFamily, expr);
 }
 
+static FcBool
+_FcParseAliasAddScanDeleteRule (FcConfigParse *parse,
+                                const FcExpr  *leaf,
+                                int            gf_value)
+{
+    FcExpr *e, *ex;
+    FcTest *t, *t2;
+    FcEdit *ed;
+    FcRule *r1, *r2, *r3;
+    int     n;
+
+    e = FcExprDup (parse->config, leaf);
+    if (!e)
+	return FcFalse;
+    t = FcTestCreate (parse, FcMatchScan, FcQualAny,
+                      (FcChar8 *)FC_FAMILY,
+                      FC_OP (FcOpEqual, FcOpFlagIgnoreBlanks), e);
+    if (!t) {
+	FcExprDestroy (e);
+	return FcFalse;
+    }
+    r1 = FcRuleCreate (FcRuleTest, t);
+    if (!r1) {
+	FcTestDestroy (t);
+	return FcFalse;
+    }
+    ex = FcExprCreateInteger (parse->config, gf_value);
+    if (!ex) {
+	FcRuleDestroy (r1);
+	return FcFalse;
+    }
+    t2 = FcTestCreate (parse, FcMatchScan, FcQualAny,
+                       (FcChar8 *)FC_GENERIC_FAMILY,
+                       FcOpEqual, ex);
+    if (!t2) {
+	FcExprDestroy (ex);
+	FcRuleDestroy (r1);
+	return FcFalse;
+    }
+    r2 = FcRuleCreate (FcRuleTest, t2);
+    if (!r2) {
+	FcTestDestroy (t2);
+	FcRuleDestroy (r1);
+	return FcFalse;
+    }
+    r1->next = r2;
+    ed = FcEditCreate (parse, FC_GENERIC_FAMILY_OBJECT,
+                       FcOpDelete, NULL, FcValueBindingWeak);
+    if (!ed) {
+	FcRuleDestroy (r1);
+	return FcFalse;
+    }
+    r3 = FcRuleCreate (FcRuleEdit, ed);
+    if (!r3) {
+	FcEditDestroy (ed);
+	FcRuleDestroy (r1);
+	return FcFalse;
+    }
+    r2->next = r3;
+    if ((n = FcRuleSetAdd (parse->ruleset, r1, FcMatchScan)) == -1) {
+	FcRuleDestroy (r1);
+	return FcFalse;
+    }
+    if (parse->config->maxObjects < n)
+	parse->config->maxObjects = n;
+    return FcTrue;
+}
+
+static void
+_FcParseAliasAddScanRule (FcConfigParse *parse,
+                          const FcExpr  *leaf,
+                          const FcChar8 *generic,
+                          FcOp           op,
+                          FcValueBinding binding)
+{
+    FcExpr           *e, *ex;
+    FcTest           *t;
+    FcEdit           *ed;
+    FcRule           *rt, *re;
+    int               n;
+    const FcConstant *c;
+
+    c = FcNameGetConstantFor (generic, FC_GENERIC_FAMILY);
+    if (!c)
+	return;
+
+    if (c->value != FC_FAMILY_UNKNOWN)
+	_FcParseAliasAddScanDeleteRule (parse, leaf, FC_FAMILY_UNKNOWN);
+    _FcParseAliasAddScanDeleteRule (parse, leaf, c->value);
+
+    e = FcExprDup (parse->config, leaf);
+    if (!e)
+	return;
+    t = FcTestCreate (parse, FcMatchScan, FcQualAny,
+                      (FcChar8 *)FC_FAMILY,
+                      FC_OP (FcOpEqual, FcOpFlagIgnoreBlanks), e);
+    if (!t) {
+	FcExprDestroy (e);
+	return;
+    }
+    rt = FcRuleCreate (FcRuleTest, t);
+    if (!rt) {
+	FcTestDestroy (t);
+	return;
+    }
+    ex = FcExprCreateConst (parse->config, generic);
+    if (!ex) {
+	FcRuleDestroy (rt);
+	return;
+    }
+    ed = FcEditCreate (parse, FC_GENERIC_FAMILY_OBJECT,
+                       FcOpAppend, ex, binding);
+    if (!ed) {
+	FcExprDestroy (ex);
+	FcRuleDestroy (rt);
+	return;
+    }
+    re = FcRuleCreate (FcRuleEdit, ed);
+    if (!re) {
+	FcEditDestroy (ed);
+	FcRuleDestroy (rt);
+	return;
+    }
+    rt->next = re;
+    if ((n = FcRuleSetAdd (parse->ruleset, rt, FcMatchScan)) == -1)
+	FcRuleDestroy (rt);
+    else if (parse->config->maxObjects < n)
+	parse->config->maxObjects = n;
+}
+
+static void
+_FcParseAliasForGenericFamilyWalk (FcConfigParse *parse,
+                                   const FcExpr  *edit,
+                                   const FcChar8 *generic,
+                                   FcOp           op,
+                                   FcValueBinding binding)
+{
+    while (edit) {
+	if (edit->op == FcOpString) {
+	    _FcParseAliasAddScanRule (parse, edit, generic, op, binding);
+	    break;
+	} else if (edit->op == FcOpComma) {
+	    if (edit->u.tree.left)
+		_FcParseAliasForGenericFamilyWalk (parse, edit->u.tree.left, generic, op, binding);
+	    edit = edit->u.tree.right;
+	} else {
+	    break;
+	}
+    }
+}
+
+static void
+FcParseAliasForGenericFamily (FcConfigParse *parse,
+                              const FcExpr  *test,
+                              const FcExpr  *edit,
+                              FcOp           op,
+                              FcValueBinding binding)
+{
+    const FcConstant *c;
+
+    if (!test || test->op != FcOpString || !edit)
+	return;
+    c = FcNameGetConstantFor (test->u.sval, FC_GENERIC_FAMILY);
+    if (!c)
+	return;
+    _FcParseAliasForGenericFamilyWalk (parse, edit, test->u.sval, op, binding);
+}
+
+static void
+FcParseAliasAddEdit (FcConfigParse *parse,
+                     FcExpr        *texpr,
+                     FcExpr        *eexpr,
+                     FcOp           op,
+                     FcValueBinding binding,
+                     FcRule       **tail_for_pat)
+{
+    FcEdit *edit;
+
+    edit = FcEditCreate (parse, FC_FAMILY_OBJECT, op, eexpr, binding);
+    if (!edit) {
+	FcExprDestroy (eexpr);
+	return;
+    }
+    (*tail_for_pat)->next = FcRuleCreate (FcRuleEdit, edit);
+    if (!(*tail_for_pat)->next) {
+	FcEditDestroy (edit);
+	return;
+    }
+    *tail_for_pat = (*tail_for_pat)->next;
+    FcParseAliasForGenericFamily (parse, texpr, eexpr, op, binding);
+}
+
 static void
 FcParseAlias (FcConfigParse *parse)
 {
     FcExpr        *family = 0, *accept = 0, *prefer = 0, *def = 0, *newp = 0;
-    FcEdit        *edit = 0;
     FcVStack      *vstack;
     FcRule        *rule = NULL, *r;
     FcValueBinding binding;
     int            n;
+    const FcChar8 *ver;
 
     if (!FcConfigLexBinding (parse, FcConfigGetAttribute (parse, "binding"), &binding))
 	return;
+    ver = FcConfigGetAttribute (parse, "since");
+    if (ver && !_check_fontconfig_version (parse, (const char *)ver)) {
+	return;
+    }
     while ((vstack = FcVStackPeek (parse))) {
 	switch ((int)vstack->tag) {
 	case FcVStackFamily:
@@ -1917,49 +2308,19 @@ FcParseAlias (FcConfigParse *parse)
 	    r = rule = FcRuleCreate (FcRuleTest, t);
 	}
     }
-    if (prefer) {
-	edit = FcEditCreate (parse,
-	                     FC_FAMILY_OBJECT,
-	                     FcOpPrepend,
-	                     prefer,
-	                     binding);
-	if (!edit)
-	    FcExprDestroy (prefer);
-	else {
-	    r->next = FcRuleCreate (FcRuleEdit, edit);
-	    r = r->next;
-	}
-    }
-    if (accept) {
-	edit = FcEditCreate (parse,
-	                     FC_FAMILY_OBJECT,
-	                     FcOpAppend,
-	                     accept,
-	                     binding);
-	if (!edit)
-	    FcExprDestroy (accept);
-	else {
-	    r->next = FcRuleCreate (FcRuleEdit, edit);
-	    r = r->next;
-	}
-    }
-    if (def) {
-	edit = FcEditCreate (parse,
-	                     FC_FAMILY_OBJECT,
-	                     FcOpAppendLast,
-	                     def,
-	                     binding);
-	if (!edit)
-	    FcExprDestroy (def);
-	else {
-	    r->next = FcRuleCreate (FcRuleEdit, edit);
-	    r = r->next;
-	}
-    }
-    if ((n = FcRuleSetAdd (parse->ruleset, rule, FcMatchPattern)) == -1)
+    if (prefer)
+	FcParseAliasAddEdit (parse, family, prefer, FcOpPrepend, binding, &r);
+    if (accept)
+	FcParseAliasAddEdit (parse, family, accept, FcOpAppend, binding, &r);
+    if (def)
+	FcParseAliasAddEdit (parse, family, def, FcOpAppendLast, binding, &r);
+
+    if ((n = FcRuleSetAdd (parse->ruleset, rule, FcMatchPattern)) == -1) {
 	FcRuleDestroy (rule);
-    else if (parse->config->maxObjects < n)
+	return;
+    } else if (parse->config->maxObjects < n) {
 	parse->config->maxObjects = n;
+    }
 }
 
 static void
@@ -2569,13 +2930,17 @@ FcParseEdit (FcConfigParse *parse)
 static void
 FcParseMatch (FcConfigParse *parse)
 {
-    const FcChar8 *kind_name;
+    const FcChar8 *kind_name, *ver;
     FcMatchKind    kind;
     FcVStack      *vstack;
     FcRule        *rule = NULL, *r;
     int            n;
 
     kind_name = FcConfigGetAttribute (parse, "target");
+    ver = FcConfigGetAttribute (parse, "since");
+    if (ver && !_check_fontconfig_version (parse, (const char *)ver)) {
+	return;
+    }
     if (!kind_name)
 	kind = FcMatchPattern;
     else {
@@ -3204,6 +3569,17 @@ FcConfigParseAndLoadFromMemoryInternal (FcConfig      *config,
     if (!XML_ParseBuffer (p, buflen, buflen == 0))
 #endif
 	{
+	    XML_Error xmlerror = XML_GetErrorCode (p);
+	    if (xmlerror && XML_ErrorCode (xmlerror) == XML_ERROR_ABORTED) {
+		error = FcFalse;
+		goto bail3;
+	    }
+#ifdef ENABLE_LIBXML2
+	    if (!xmlerror && p->errNo == XML_ERR_USER_STOP) {
+		error = FcFalse;
+		goto bail3;
+	    }
+#endif
 	    FcConfigMessage (&parse, FcSevereError, "%s",
 	                     XML_ErrorString (XML_GetErrorCode (p)));
 	    goto bail3;
@@ -3313,10 +3689,13 @@ _FcConfigParse (FcConfig      *config,
     do {
 	len = read (fd, buf, BUFSIZ);
 	if (len < 0) {
-	    int  errno_ = errno;
-	    char ebuf[BUFSIZ + 1];
+	    int   errno_ = errno;
+	    char  ebuf[BUFSIZ + 1];
+	    char *msg = ebuf;
 
-#if HAVE_STRERROR_R
+#if HAVE_GNU_STRERROR_R
+	    msg = strerror_r (errno_, ebuf, BUFSIZ);
+#elif HAVE_STRERROR_R
 	    strerror_r (errno_, ebuf, BUFSIZ);
 #elif HAVE_STRERROR
 	    char  *tmp = strerror (errno_);
@@ -3326,7 +3705,7 @@ _FcConfigParse (FcConfig      *config,
 #else
 	    ebuf[0] = 0;
 #endif
-	    FcConfigMessage (0, FcSevereError, "failed reading config file: %s: %s (errno %d)", realfilename, ebuf, errno_);
+	    FcConfigMessage (0, FcSevereError, "failed reading config file: %s: %s (errno %d)", realfilename, msg, errno_);
 	    close (fd);
 	    goto bail1;
 	}

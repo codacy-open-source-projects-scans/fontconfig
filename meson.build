@@ -1,5 +1,5 @@
 project('fontconfig', 'c',
-  version: '2.17.1',
+  version: '2.18.3',
   meson_version : '>= 1.11.0',
   default_options: [
     'c_std=c11,c99',
@@ -25,7 +25,21 @@ curversion = fc_version_minor - 1
 libversion = '@0@.@1@.0'.format(soversion, curversion)
 defversion = '@0@.@1@'.format(curversion, fc_version_micro)
 osxversion = curversion + 1
-cacheversion = '11'
+cacheversion = 12
+# The reader accepts caches down to cachemincompat (see FcDirCacheProcess
+# probing and the version checks in fccache.c).  Backward reading is only
+# safe while every object added since cachemincompat can be reconstructed
+# from what old caches already hold (today only genericfamily, re-derived
+# in fcmatch.c from the family name).  A future cacheversion bump that
+# changes the on-disk format, or adds an object that is NOT reconstructable
+# that way, MUST also raise cachemincompat.
+cachemincompat = 9
+cachesnapversion = 0
+if cachesnapversion > 0
+  nextcacheversion = cacheversion + 1
+else
+  nextcacheversion = 0
+endif
 
 freetype_req = '>= 21.0.15'
 freetype_req_cmake = '>= 2.8.1'
@@ -92,6 +106,21 @@ if (fontations.enabled())
   add_languages(['rust'], native: false, required : true)
 endif
 
+woff2_opt = get_option('woff2')
+if fontations.enabled()
+  woff2_dep = dependency('libwoff2dec', required: woff2_opt)
+else
+  if woff2_opt.enabled()
+    warning('woff2 is only needed when fontations is active')
+  endif
+  woff2_dep = dependency('', required: false)
+endif
+if woff2_dep.found()
+  conf.set('HAVE_LIBWOFF2DEC', 1)
+  add_languages(['cpp'], native: false, required: false)
+  add_project_arguments('-DHAVE_CONFIG_H', language: 'cpp')
+endif
+
 pkgmod = import('pkgconfig')
 python3 = import('python').find_installation()
 pytest = find_program('pytest', required: false)
@@ -121,6 +150,7 @@ check_headers = [
 
 check_funcs = [
   ['link'],
+  ['symlink'],
   ['mkstemp'],
   ['_mktemp_s'],
   ['mkdtemp'],
@@ -153,6 +183,8 @@ check_funcs = [
   ['gettext'],
   ['localtime_r'],
   ['strdup'],
+  ['posix_memalign', {'prefix': '#include <stdlib.h>'}],
+  ['uselocale'],
 ]
 
 check_freetype_funcs = [
@@ -191,6 +223,9 @@ add_project_arguments('-DHAVE_CONFIG_H', language: 'c')
 c_args = []
 
 deps = [freetype_dep, xml_dep]
+if woff2_dep.found()
+  deps += [woff2_dep]
+endif
 incbase = include_directories('.', 'fc-lang')
 
 # For compatibility to autoconf (regardless of the usage in fontconfig)
@@ -216,6 +251,11 @@ endif
 
 i18n = import('i18n')
 gettext_args = [ '--msgid-bugs-address=@0@'.format(conf.get('PACKAGE_BUGREPORT')) ]
+
+# Internal test instrumentation hooks (never enable for production builds)
+if get_option('test-hooks').enabled()
+  conf.set('ENABLE_TEST_HOOKS', 1)
+endif
 
 # Check for libintl.h
 opt_nls = get_option('nls')
@@ -327,21 +367,32 @@ if cc.compiles(files('meson-cc-tests/pthread-prio-inherit-test.c'))
   conf.set('HAVE_PTHREAD_PRIO_INHERIT', 1)
 endif
 
-if cc.links(files('meson-cc-tests/stdatomic-primitives-test.c'), name: 'stdatomic.h atomics')
+if cc.compiles(files('meson-cc-tests/gnu-strerror_r-test.c'))
+  conf.set('HAVE_GNU_STRERROR_R', 1)
+endif
+
+if cc.links(
+  files('meson-cc-tests/stdatomic-primitives-test.c'),
+  name: 'stdatomic.h atomics',
+)
   conf.set('HAVE_STDATOMIC_PRIMITIVES', 1)
 endif
 
-if cc.links(files('meson-cc-tests/intel-atomic-primitives-test.c'), name: 'Intel atomics')
+if cc.links(
+  files('meson-cc-tests/intel-atomic-primitives-test.c'),
+  name: 'Intel atomics',
+)
   conf.set('HAVE_INTEL_ATOMIC_PRIMITIVES', 1)
 endif
 
-if cc.links(files('meson-cc-tests/solaris-atomic-operations.c'), name: 'Solaris atomic ops')
+if cc.links(
+  files('meson-cc-tests/solaris-atomic-operations.c'),
+  name: 'Solaris atomic ops',
+)
   conf.set('HAVE_SOLARIS_ATOMIC_OPS', 1)
 endif
 
-if cc.links(files('meson-cc-tests/c99-vsnprint-test.c'), name: 'C99 compliant vsnprintf()')
-  conf.set('HAVE_C99_VSNPRINTF', 1)
-endif
+conf.set('HAVE_C99_VSNPRINTF', 1)
 
 prefix = get_option('prefix')
 
@@ -486,6 +537,8 @@ conf.set('FC_GPERF_SIZE_T', gperf_len_type,
          description : 'The type of gperf "len" parameter')
 
 conf.set('_GNU_SOURCE', true)
+conf.set('_FILE_OFFSET_BITS', 64)
+conf.set('_TIME_BITS', 64)
 
 conf.set_quoted('GETTEXT_PACKAGE', meson.project_name())
 
@@ -507,22 +560,43 @@ fcobjs_h = files('src/fcobjs.h')[0]
 subdir('fontconfig')
 
 
-alias_input_headers = [fontconfig_h, 'src/fcdeprecate.h', 'fontconfig/fcprivate.h']
+alias_input_headers = [
+  fontconfig_h,
+  'src/fcdeprecate.h',
+  'fontconfig/fcprivate.h',
+]
 if get_option('fontations').enabled()
   alias_input_headers += ['fontconfig/fcfontations.h']
 endif
 
-alias_headers = custom_target('alias_headers',
-                              output: ['fcalias.h', 'fcaliastail.h'],
-                              input: alias_input_headers,
-                              command: [python3, makealias, join_paths(meson.current_source_dir(), 'src'), '@OUTPUT@', '@INPUT@'],
-                             )
+alias_headers = custom_target(
+  'alias_headers',
+  output: ['fcalias.h', 'fcaliastail.h'],
+  input: alias_input_headers,
+  command: [
+    python3,
+    makealias,
+    join_paths(meson.current_source_dir(), 'src'),
+    '@OUTPUT@',
+    '@INPUT@',
+  ],
+)
 
-ft_alias_headers = custom_target('ft_alias_headers',
-                                 output: ['fcftalias.h', 'fcftaliastail.h'],
-                                 input: ['fontconfig/fcfreetype.h'],
-                                 command: [python3, makealias, join_paths(meson.current_source_dir(), 'src'), '@OUTPUT@', '@INPUT@']
-                                )
+ft_alias_headers = custom_target(
+  'ft_alias_headers',
+  output: ['fcftalias.h', 'fcftaliastail.h'],
+  input: ['fontconfig/fcfreetype.h'],
+  command: [
+    python3,
+    makealias,
+    join_paths(meson.current_source_dir(), 'src'),
+    '@OUTPUT@',
+    '@INPUT@',
+  ],
+)
+
+fcint_dep = declare_dependency(sources: [alias_headers, ft_alias_headers])
+deps += [fcint_dep]
 
 tools_man_pages = []
 
@@ -531,12 +605,27 @@ tools_man_pages = []
 subdir('fc-case')
 subdir('fc-lang')
 subdir('fc-const')
+subdir('fc-genericfamily')
 subdir('src')
 
 if get_option('fontations').enabled()
   subdir('fc-fontations')
   lib_fontconfig_kwargs = lib_fontconfig_kwargs + {
     'link_with' : lib_fontconfig_kwargs['link_with'] + [fc_fontations, fontations_query_lib]}
+endif
+
+link_depends = []
+link_args = []
+# Needs to create an export file on IBM i and AIX
+if host_machine.system() in ['os400', 'aix']
+  export_file = custom_target('make_export_file',
+                              output: ['fontconfig.exp'],
+                              input: alias_input_headers + ['fontconfig/fcfreetype.h'],
+                              command: [python3, makealias, '--make-export-file', join_paths(meson.current_source_dir(), 'src'), '@OUTPUT@', '@INPUT@']
+                            )
+
+  link_args = ['-Wl,-bE:' + export_file.full_path()]
+  link_depends = [export_file]
 endif
 
 libfontconfig = library('fontconfig',
@@ -546,6 +635,8 @@ libfontconfig = library('fontconfig',
   version: libversion,
   darwin_versions: osxversion,
   install: true,
+  link_args: link_args,
+  link_depends: link_depends,
   kwargs: lib_fontconfig_kwargs)
 
 if get_option('default_library') == 'both'
@@ -562,12 +653,21 @@ fontconfig_dep = declare_dependency(link_with: libfontconfig,
   include_directories: incbase,
   dependencies: deps,
 )
+meson.override_dependency('fontconfig', fontconfig_dep)
+
+pkg_requires_private = []
+if freetype_dep.found()
+  pkg_requires_private += ['freetype2 ' + freetype_req]
+endif
+if woff2_dep.found()
+  pkg_requires_private += ['libwoff2dec']
+endif
 
 pkgmod.generate(libfontconfig,
   description: 'Font configuration and customization library',
   filebase: 'fontconfig',
   name: 'Fontconfig',
-  requires_private: ['freetype2 ' + freetype_req],
+  requires_private: pkg_requires_private,
   version: fc_version,
   variables: [
     'sysconfdir=@0@'.format(join_paths(prefix, get_option('sysconfdir'))),
@@ -630,7 +730,6 @@ install_headers(fc_headers, subdir: meson.project_name())
 
 if not meson.is_subproject()
   meson.add_dist_script('build-aux/meson-dist-docs.py')
-  meson.add_dist_script('build-aux/meson-dist-autotools.py')
 endif
 
 if host_machine.system() != 'windows'
@@ -645,11 +744,13 @@ summary({
   'Documentation': (doc_targets.length() > 0 ? doc_targets : false),
   'NLS': not opt_nls.disabled(),
   'Tests': not get_option('tests').disabled(),
+  'Tests (external fonts)': get_option('tests-external-fonts').allowed(),
   'Pytest': pytest.found(),
   'Tools': not get_option('tools').disabled(),
   'iconv': found_iconv == 1,
   'XML backend': xmltype,
-  'Fontations support' : fontations
+  'Fontations support' : fontations,
+  'WOFF2 support (Fontations)' : woff2_dep.found(),
 }, section: 'General', bool_yn: true, list_sep: ', ')
 summary({
   'Hinting': preferred_hinting,

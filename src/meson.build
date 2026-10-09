@@ -9,15 +9,22 @@ endif
 # Factor our pattern manipulation code into its own library
 # to break the depedency cycle:
 # FontConfig pattern handling - Fontations code - FontConfig.
-pattern_sources = [ 'fcpat.c', fcstdint_h, fclang_h, alias_headers, ft_alias_headers ]
-pattern_lib = static_library('patternlib_internal',
-                                    pattern_sources,
-                                    include_directories: incbase,
-                                    dependencies: [deps],
-                                    c_args: win_export_args
-                    )
+pattern_sources = [
+  'fcpat.c',
+  fcstdint_h,
+  fclang_h,
+  alias_headers,
+  ft_alias_headers,
+]
+pattern_lib = static_library(
+  'patternlib_internal',
+  pattern_sources,
+  include_directories: incbase,
+  dependencies: [deps],
+  c_args: win_export_args,
+)
 
-fc_sources = files([
+fc_sources = files(
   'fcatomic.c',
   'fccache.c',
   'fccfg.c',
@@ -30,6 +37,7 @@ fc_sources = files([
   'fcformat.c',
   'fcfreetype.c',
   'fcfs.c',
+  'fcgenericalias.c',
   'fcptrlist.c',
   'fchash.c',
   'fcinit.c',
@@ -46,34 +54,51 @@ fc_sources = files([
   'fcweight.c',
   'fcxml.c',
   'ftglue.c',
-])
+)
 
 
 
-fcobjshash_h = cc.preprocess('fcobjshash.gperf.h', include_directories: incbase)
+fcobjshash_gperf_i = cc.preprocess(
+  'fcobjshash.gperf.c',
+  include_directories: incbase,
+)
 fcobjshash_gperf = custom_target(
-  input: fcobjshash_h,
+  input: fcobjshash_gperf_i,
   output: 'fcobjshash.gperf',
   command: ['cutout.py', '@INPUT@', '@OUTPUT@'],
   build_by_default: true,
 )
 
-fcobjshash_h = custom_target('fcobjshash.h',
+fcobjshash_h = custom_target(
+  'fcobjshash.h',
   input: fcobjshash_gperf,
   output: 'fcobjshash.h',
-  command: [gperf, '--pic', '-m', '100', '@INPUT@', '--output-file', '@OUTPUT@']
+  command: [gperf, '--pic', '-m', '100', '@INPUT@', '--output-file', '@OUTPUT@'],
 )
 
-lib_fontconfig_sources = [fc_sources, alias_headers, ft_alias_headers, fccase_h, fcconst_h, fclang_h, fcobjshash_h, fcstdint_h]
+lib_fontconfig_sources = [
+  fc_sources,
+  alias_headers,
+  ft_alias_headers,
+  fccase_h,
+  fcconst_h,
+  fcgenericfamily_h,
+  fclang_h,
+  fcobjshash_h,
+  fcstdint_h,
+]
 lib_fontconfig_kwargs = {
   'include_directories': incbase,
   'dependencies': [deps, math_dep],
   'link_with': [pattern_lib],
 }
 
-fcarch = executable('fcarch', ['fcarch.c', 'fcarch.h', fcstdint_h, fclang_h],
+fcarch = executable(
+  'fcarch',
+  ['fcarch.c', 'fcarch.h', fcstdint_h, fclang_h],
   include_directories: [incbase, incsrc],
   c_args: c_args,
-  dependencies: [libintl_dep],
+  dependencies: [libintl_dep, fcint_dep],
   install: false,
-  install_tag: 'runtime')
+  install_tag: 'runtime',
+)

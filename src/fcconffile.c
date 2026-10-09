@@ -2,8 +2,6 @@
 /* SPDX-License-Identifier: HPND */
 
 #include "fcint.h"
-#include "fontconfig/fontconfig.h"
-
 
 static FcBool
 FcConfigFileGenerateGenericAlias (FcConfig  *config,
@@ -11,64 +9,95 @@ FcConfigFileGenerateGenericAlias (FcConfig  *config,
                                   FcPattern *font,
                                   FcStrBuf  *buf)
 {
-    FcChar8              *family = NULL, *file = NULL;
-    const FcChar8        *gf, *s;
-    int                   generic_family = FC_FAMILY_UNKNOWN;
-    FcStrSet             *lset = NULL;
-    FcStrList            *list = NULL;
-    FcLangSet            *ls = NULL;
-    FcBool                ret = FcTrue;
+    FcChar8        *family = NULL, *file = NULL;
+    const FcChar8  *gf, *s;
+    int             generic_family;
+    FcStrSet       *lset = NULL;
+    FcStrList      *list = NULL;
+    FcLangSet      *ls = NULL;
+    FcBool          ret = FcTrue;
+    FcBool          has_lang = FcFalse;
+    FcPatternIter   iter;
+    FcValueListPtr  vl;
 
     if (FcPatternObjectGetString (font, FC_FILE_OBJECT, 0, &file) != FcResultMatch) {
 	fprintf (stderr, "Fontconfig warning: no file object in the font metadata\n");
 	return FcFalse;
     }
     if (FcPatternObjectGetString (font, FC_FAMILY_OBJECT, 0, &family) != FcResultMatch) {
-	fprintf(stderr, "Fontconfig warning: %s: no family object in the font metadata\n", file);
-	return FcFalse;
-    }
-    FcPatternObjectGetInteger (font, FC_GENERIC_FAMILY_OBJECT, 0, &generic_family);
-    if (generic_family == FC_FAMILY_UNKNOWN) {
-	/* fallback to the value that is given by users */
-	FcPatternObjectGetInteger (pat, FC_GENERIC_FAMILY_OBJECT, 0, &generic_family);
-    }
-    FcPatternObjectGetLangSet (pat, FC_LANG_OBJECT, 0, &ls);
-    gf = FcNameGetConstantNameFromObject (FC_GENERIC_FAMILY_OBJECT,
-                                          generic_family);
-    if (!gf) {
-	fprintf (stderr, "Fontconfig warning: %s: Unable to determine generic family from either of font nor pattern\n", file);
+	fprintf (stderr, "Fontconfig warning: %s: no family object in the font metadata\n", file);
 	return FcFalse;
     }
 
-    if (ls) {
-        lset = FcLangSetGetLangs (ls);
-        if (!lset)
+    FcPatternIterStart (pat, &iter);
+    if (FcPatternFindObjectIter (pat, &iter, FC_GENERIC_FAMILY_OBJECT)) {
+	vl = FcPatternIterGetValues (pat, &iter);
+    } else {
+	FcPatternIterStart (font, &iter);
+	if (FcPatternFindObjectIter (font, &iter, FC_GENERIC_FAMILY_OBJECT)) {
+	    vl = FcPatternIterGetValues (font, &iter);
+	} else {
+	    fprintf (stderr, "Fontconfig warning: %s: Unable to determine generic family from either of font nor pattern\n", file);
 	    return FcFalse;
-        list = FcStrListCreate (lset);
-        if (!list) {
-            ret = FcFalse;
-            goto bail;
 	}
-	if (lset->num == 0)
-	    goto nolang;
-        while ((s = FcStrListNext (list))) {
-	    if (!FcStrBufFormat (buf,
-	                         "  <match pattern=\"pattern\">\n"
-	                         "    <test name=\"lang\" compare=\"contains\">\n"
-	                         "      <string>%s</string>\n"
-	                         "    </test>\n"
-	                         "    <test name=\"genericfamily\">\n"
-	                         "      <const>%s</const>\n"
-	                         "    </test>\n"
-	                         "    <edit name=\"family\" mode=\"prepend\">\n"
-	                         "      <string>%s</string>\n"
-	                         "    </edit>\n"
-	                         "  </match>\n\n",
-	                         s, gf, family)) {
+    }
+
+    FcPatternObjectGetLangSet (pat, FC_LANG_OBJECT, 0, &ls);
+    if (ls) {
+	lset = FcLangSetGetLangs (ls);
+	if (!lset)
+	    return FcFalse;
+	if (lset->num > 0)
+	    has_lang = FcTrue;
+    }
+
+    for (; vl; vl = FcValueListNext (vl)) {
+	if (vl->value.type == FcTypeDouble)
+	    generic_family = (int)vl->value.u.d;
+	else if (vl->value.type == FcTypeInteger)
+	    generic_family = vl->value.u.i;
+	else
+	    continue;
+
+	gf = FcNameGetConstantNameFromObject (FC_GENERIC_FAMILY_OBJECT,
+	                                      generic_family);
+	if (!gf)
+	    continue;
+
+	if (has_lang) {
+	    list = FcStrListCreate (lset);
+	    if (!list) {
 		ret = FcFalse;
-	        goto bail;
+		goto bail;
 	    }
-        }
+	    while ((s = FcStrListNext (list))) {
+		if (!FcStrBufFormat (buf,
+		                     "  <alias>\n"
+		                     "    <family>%s</family>\n"
+		                     "    <test name=\"lang\" compare=\"contains\">\n"
+		                     "      <string>%s</string>\n"
+		                     "    </test>\n"
+		                     "    <prefer><family>%s</family></prefer>\n"
+		                     "  </alias>\n\n",
+		                     gf, s, family)) {
+		    ret = FcFalse;
+		    FcStrListDone (list);
+		    goto bail;
+		}
+	    }
+	    FcStrListDone (list);
+	    list = NULL;
+	} else {
+	    if (!FcStrBufFormat (buf,
+	                         "  <alias>\n"
+	                         "    <family>%s</family>\n"
+	                         "    <prefer><family>%s</family></prefer>\n"
+	                         "  </alias>\n",
+	                         gf, family)) {
+		ret = FcFalse;
+		goto bail;
+	    }
+	}
 	if (!FcStrBufFormat (buf,
 	                     "  <alias>\n"
 	                     "    <family>%s</family>\n"
@@ -77,81 +106,12 @@ FcConfigFileGenerateGenericAlias (FcConfig  *config,
 	                     family, gf)) {
 	    ret = FcFalse;
 	    goto bail;
-        }
-    } else {
-    nolang:
-	if (!FcStrBufFormat (buf,
-	                     "  <match target=\"pattern\">\n"
-	                     "    <test name=\"family\">\n"
-	                     "      <string>%s</string>\n"
-	                     "    </test>\n"
-	                     "    <edit name=\"family\" mode=\"prepend\">\n"
-	                     "      <string>%s</string>\n"
-	                     "    </edit>\n"
-	                     "  </match>\n"
-	                     "  <alias>\n"
-	                     "    <family>%s</family>\n"
-	                     "    <default><family>%s</family></default>\n"
-	                     "  </alias>\n",
-	                     gf, family, family, gf)) {
-	    ret = FcFalse;
-	    goto bail;
-        }
+	}
     }
- bail:
-    if (list)
-	FcStrListDone(list);
+
+bail:
     if (lset)
 	FcStrSetDestroy (lset);
-
-    return ret;
-}
-
-static FcBool
-FcConfigFileGenerateGenericFamily (FcConfig  *config,
-                                   FcPattern *pat,
-                                   FcPattern *font,
-                                   FcStrBuf  *buf)
-{
-    FcChar8              *family = NULL, *file = NULL;
-    const FcChar8        *gf;
-    int                   generic_family = FC_FAMILY_UNKNOWN;
-    FcBool                ret = FcTrue;
-
-    if (FcPatternObjectGetString (font, FC_FILE_OBJECT, 0, &file) != FcResultMatch) {
-	fprintf (stderr, "Fontconfig warning: no file object in the font metadata\n");
-	return FcFalse;
-    }
-    if (FcPatternObjectGetString (font, FC_FAMILY_OBJECT, 0, &family) != FcResultMatch) {
-	fprintf(stderr, "Fontconfig warning: %s: no family object in the font metadata\n", file);
-	return FcFalse;
-    }
-    FcPatternObjectGetInteger (font, FC_GENERIC_FAMILY_OBJECT, 0, &generic_family);
-    if (generic_family == FC_FAMILY_UNKNOWN) {
-	/* fallback to the value that is given by users */
-	FcPatternObjectGetInteger (pat, FC_GENERIC_FAMILY_OBJECT, 0, &generic_family);
-    }
-    gf = FcNameGetConstantNameFromObject (FC_GENERIC_FAMILY_OBJECT,
-                                          generic_family);
-    if (!gf) {
-	fprintf (stderr, "Fontconfig warning: %s: Unable to determine generic family from either of font nor pattern\n", file);
-	return FcFalse;
-    }
-
-    if (!FcStrBufFormat (buf,
-	                 "  <match target=\"scan\">\n"
-	                 "    <test name=\"family\">\n"
-	                 "      <string>%s</string>\n"
-	                 "    </test>\n"
-	                 "    <edit name=\"genericfamily\" mode=\"assign_replace\">\n"
-	                 "      <const>%s</const>\n"
-	                 "    </edit>\n"
-	                 "  </match>\n",
-	                 family, gf)) {
-	ret = FcFalse;
-	goto bail;
-    }
- bail:
 
     return ret;
 }
@@ -161,33 +121,40 @@ FcConfigFileGenerate (FcConfig      *config,
                       FcPattern     *pat,
                       const FcChar8 *font_path)
 {
-    FcFontSet   *fs = NULL;
-    int          i;
-    FcStrBuf     buf;
+    FcFontSet *fs = NULL;
+    FcChar8   *ret;
+    FcBool     failed = FcFalse;
+    int        i;
+    FcStrBuf   buf;
 
     FcStrBufInit (&buf, NULL, 0);
     fs = FcFontSetCreate();
 
     if (!FcFileIsDir (font_path)) {
-        FcFileScan(fs, NULL, NULL, NULL, font_path, FcTrue);
+	FcFileScan (fs, NULL, NULL, NULL, font_path, FcTrue);
     } else {
-        FcStrSet *dirs = FcStrSetCreate();
-        FcStrList *dirlist = FcStrListCreate (dirs);
+	FcStrSet  *dirs = FcStrSetCreate();
+	FcStrList *dirlist = FcStrListCreate (dirs);
 
-        do {
+	do {
 	    FcDirScan (fs, dirs, NULL, NULL, font_path, FcTrue);
-        } while ((font_path = FcStrListNext (dirlist)));
+	} while ((font_path = FcStrListNext (dirlist)));
 
-        FcStrListDone (dirlist);
-        FcStrSetDestroy (dirs);
+	FcStrListDone (dirlist);
+	FcStrSetDestroy (dirs);
     }
     if (fs->nfont > 0) {
 	FcHashTable *record = NULL;
+	FcChar8     *target_family = NULL;
+	FcBool       found = FcFalse;
 
-        FcStrBufString (&buf,
-                        (const FcChar8 *)"<?xml version=\"1.0\"?>\n"
-	                                 "<!DOCTYPE fontconfig SYSTEM \"urn:fontconfig:fonts.dtd\">\n"
-                                         "<fontconfig>\n");
+	FcPatternObjectGetString (pat, FC_FAMILY_OBJECT, 0, &target_family);
+
+	FcStrBufString (&buf,
+	                (const FcChar8 *)
+	                    "<?xml version=\"1.0\"?>\n"
+	                    "<!DOCTYPE fontconfig SYSTEM \"urn:fontconfig:fonts.dtd\">\n"
+	                    "<fontconfig>\n");
 
 	record = FcHashTableCreate ((FcHashFunc)FcStrHashIgnoreBlanksAndCase,
 	                            (FcCompareFunc)FcStrCmpIgnoreBlanksAndCase,
@@ -206,29 +173,41 @@ FcConfigFileGenerate (FcConfig      *config,
 	                                  &family) != FcResultMatch) {
 		continue;
 	    }
+	    if (target_family &&
+	        FcStrCmpIgnoreBlanksAndCase (family, target_family) != 0) {
+		continue;
+	    }
+	    found = FcTrue;
 	    if (!FcHashTableFind (record, family, (void **)&p)) {
 		FcPatternReference (p);
 		FcHashTableReplace (record, (void *)family, (void *)p);
-		if (!FcConfigFileGenerateGenericFamily (config, pat, p, &buf)) {
-		    FcStrBufDestroy (&buf);
-		    FcStrBufInit (&buf, NULL, 0);
-		    goto bail;
-		}
 		if (!FcConfigFileGenerateGenericAlias (config, pat, p, &buf)) {
-		    FcStrBufDestroy (&buf);
-		    FcStrBufInit (&buf, NULL, 0);
+		    failed = FcTrue;
 		    goto bail;
 		}
 	    }
 	}
 	FcHashTableDestroy (record);
 
-        FcStrBufString (&buf, (const FcChar8 *)"</fontconfig>\n");
+	if (target_family && !found) {
+	    fprintf (stderr, "Fontconfig warning: %s: family not found in %s\n",
+	             target_family, font_path);
+	    failed = FcTrue;
+	    goto bail;
+	}
+
+	FcStrBufString (&buf, (const FcChar8 *)"</fontconfig>\n");
     }
- bail:
+bail:
     FcFontSetDestroy (fs);
 
-    return FcStrBufDone (&buf);
+    ret = FcStrBufDone (&buf);
+    if (failed && ret) {
+	free (ret);
+	ret = NULL;
+    }
+
+    return ret;
 }
 
 #define __fcconffile__

@@ -163,6 +163,8 @@ def test_with_complicated_dir_structure(fctest, fcfont):
 
 
 def test_subdir_with_out_of_date_cache(fctest, fcfont):
+    # This test case depends on the timestamp. Do not fix with SOURCE_DATE_EPOCH
+    fctest.env.pop('SOURCE_DATE_EPOCH', None)
     fctest.setup()
     fctest.install_font([], 'a')
     for ret, stdout, stderr in fctest.run_cache([str(Path(fctest.fontdir.name) / 'a')]):
@@ -188,7 +190,9 @@ def test_subdir_with_out_of_date_cache(fctest, fcfont):
         assert out == out_expected
 
 
-def test_new_file_with_out_of_date_cache(fctest, fcfont):
+def test_new_file_with_out_of_date_cache(monkeypatch, fctest, fcfont):
+    # This test case depends on the timestamp. Do not fix with SOURCE_DATE_EPOCH
+    fctest.env.pop('SOURCE_DATE_EPOCH', None)
     fctest.setup()
     fctest.install_font(fcfont.fonts[0], '.')
     for ret, stdout, stderr in fctest.run_cache([fctest.fontdir.name]):
@@ -333,5 +337,6 @@ def test_xdg_cache_home(fctest, fcfont):
     phome = Path(new_home.name)
     assert (phome / '.cache').exists()
     assert (phome / '.cache' / 'fontconfig').exists()
-    cache_files = [f.name for f in (phome / '.cache' / 'fontconfig').glob('*cache*')]
+    cache_files = [f.name for f in (phome / '.cache' / 'fontconfig').glob('*cache*')
+                   if not f.is_symlink()]
     assert len(cache_files) == 1

@@ -10,6 +10,10 @@ option('nls', type : 'feature', value : 'auto', yield: true,
 option('tests', type : 'feature', value : 'auto', yield : true,
   description: 'Enable unit tests')
 option('tests-bwrap', type: 'feature', value: 'auto')
+option('tests-external-fonts', type: 'feature', value: 'enabled', yield: true,
+  description: 'Download external test fonts (requires network access)')
+option('test-hooks', type: 'feature', value: 'disabled',
+  description: 'Enable internal instrumentation hooks used by the test suite (do not enable for production builds)')
 option('tools', type : 'feature', value : 'auto', yield : true,
   description: 'Build command-line tools (fc-list, fc-query, etc.)')
 option('cache-build', type : 'feature', value : 'enabled',
@@ -19,6 +23,8 @@ option('xml-backend', type: 'combo', choices: ['auto', 'expat', 'libxml2'], valu
   description: 'Select xml backend to read config')
 option('fontations', type: 'feature', value: 'disabled',
   description: 'Use Fontations (https://github.com/googlefonts/fontations) for indexing.')
+option('woff2', type: 'feature', value: 'auto',
+  description: 'Use libwoff2dec for WOFF2 decoding support in Fontations.')
 
 # Defaults
 option('default-hinting', type: 'combo', choices: ['noinstall', 'none', 'slight', 'medium', 'full'], value: 'slight',
